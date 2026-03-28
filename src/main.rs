@@ -3,7 +3,9 @@ mod app;
 mod cli;
 mod components;
 mod config;
+mod core;
 mod errors;
+mod infra;
 mod logging;
 mod tui;
 

@@ -1,6 +1,10 @@
+use std::path::PathBuf;
+
+use crate::core::models::{CollectionNode, RequestDocument, ResponseArtifact};
+
 /// Shared action vocabulary for state transitions across the application.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Variants like Render will be used in later phases.
+#[allow(dead_code)]
 pub enum Action {
     Tick,
     Render,
@@ -9,6 +13,26 @@ pub enum Action {
     FocusPrev,
     Resize(u16, u16),
     Error(String),
+
+    // Collection actions
+    CollectionsDiscovered(Vec<CollectionNode>),
+    SelectRequest(PathBuf),
+    RequestLoaded(Box<RequestDocument>),
+    RefreshCollections,
+
+    // Editor actions
+    SaveRequest,
+    RequestSaved(PathBuf),
+
+    // Execution actions
+    SendRequest,
+    CancelRequest,
+    RequestCompleted(Box<ResponseArtifact>),
+    RequestFailed(String),
+    RequestCancelled,
+
+    // Status
+    StatusMessage(String),
 }
 
 /// Identifies which pane currently holds focus.

@@ -1,16 +1,23 @@
+use std::collections::HashMap;
+
 use color_eyre::eyre::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use ratatui::layout::{Constraint, Direction, Layout};
+use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval};
+use tokio_util::sync::CancellationToken;
 
 use crate::action::{Action, FocusTarget};
 use crate::components::Component;
 use crate::components::collections::CollectionsPane;
 use crate::components::request_editor::RequestEditorPane;
 use crate::components::response_viewer::ResponseViewerPane;
-use crate::components::status_bar;
+use crate::components::status_bar::{self, StatusBarState};
 use crate::config::Config;
+use crate::core::execution;
+use crate::core::repository;
+use crate::infra::{env_loader, http_client};
 use crate::tui::Tui;
 
 pub struct App {
@@ -20,21 +27,53 @@ pub struct App {
     collections: CollectionsPane,
     request_editor: RequestEditorPane,
     response_viewer: ResponseViewerPane,
+
+    // Async communication
+    action_tx: mpsc::UnboundedSender<Action>,
+    action_rx: mpsc::UnboundedReceiver<Action>,
+
+    // Execution state
+    http_client: reqwest::Client,
+    cancel_token: Option<CancellationToken>,
+    env_vars: HashMap<String, String>,
+    request_in_flight: bool,
+
+    // Status
+    status_message: Option<String>,
+    status_message_ticks: u32,
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
+        let (action_tx, action_rx) = mpsc::unbounded_channel();
+
+        // Load env and build client
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let env_vars = env_loader::load_env(&cwd);
+        let http_client = http_client::build_client();
+
         Self {
             config,
             focus: FocusTarget::Collections,
             should_quit: false,
             collections: CollectionsPane::default(),
-            request_editor: RequestEditorPane,
-            response_viewer: ResponseViewerPane,
+            request_editor: RequestEditorPane::default(),
+            response_viewer: ResponseViewerPane::default(),
+            action_tx,
+            action_rx,
+            http_client,
+            cancel_token: None,
+            env_vars,
+            request_in_flight: false,
+            status_message: None,
+            status_message_ticks: 0,
         }
     }
 
     pub async fn run(&mut self, tui: &mut Tui) -> Result<()> {
+        // Spawn initial collection discovery
+        self.spawn_collection_discovery();
+
         let mut events = EventStream::new();
         let mut tick = interval(self.config.tick_rate);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -56,10 +95,13 @@ impl App {
                 _ = tick.tick() => {
                     Some(Action::Tick)
                 }
+                Some(action) = self.action_rx.recv() => {
+                    Some(action)
+                }
             };
 
             if let Some(action) = maybe_action {
-                let should_render = action == Action::Render;
+                let should_render = matches!(action, Action::Render);
                 self.update(action);
 
                 if should_render {
@@ -84,7 +126,47 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
-        // Global keys always take priority.
+        let editing = self.request_editor.is_editing();
+
+        if editing {
+            // In insert mode: only Esc and Ctrl-shortcuts are global
+            match key.code {
+                KeyCode::Esc => {
+                    if self.request_in_flight {
+                        return Some(Action::CancelRequest);
+                    }
+                    // Let editor handle Esc to exit insert mode
+                    let result = self.request_editor.handle_key(key);
+                    return match result {
+                        crate::components::EventResult::Action(action) => Some(action),
+                        _ => None,
+                    };
+                }
+                _ if key.modifiers.contains(KeyModifiers::CONTROL) => match key.code {
+                    KeyCode::Char('c') => return Some(Action::Quit),
+                    KeyCode::Char('r') => {
+                        self.request_editor.sync_pending_edit();
+                        return Some(Action::SendRequest);
+                    }
+                    KeyCode::Char('s') => {
+                        self.request_editor.sync_pending_edit();
+                        return Some(Action::SaveRequest);
+                    }
+                    _ => {}
+                },
+                _ => {
+                    // All other keys go to the focused component in insert mode
+                    let result = self.focused_component_mut().handle_key(key);
+                    return match result {
+                        crate::components::EventResult::Action(action) => Some(action),
+                        _ => None,
+                    };
+                }
+            }
+            return None;
+        }
+
+        // Normal mode: global keys first
         match key.code {
             KeyCode::Char('q') => return Some(Action::Quit),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -92,10 +174,19 @@ impl App {
             }
             KeyCode::Tab => return Some(Action::FocusNext),
             KeyCode::BackTab => return Some(Action::FocusPrev),
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Some(Action::SendRequest);
+            }
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Some(Action::SaveRequest);
+            }
+            KeyCode::Esc if self.request_in_flight => {
+                return Some(Action::CancelRequest);
+            }
             _ => {}
         }
 
-        // Delegate to the focused component.
+        // Delegate to focused component
         let result = self.focused_component_mut().handle_key(key);
         match result {
             crate::components::EventResult::Action(action) => Some(action),
@@ -118,8 +209,132 @@ impl App {
             }
             Action::Error(msg) => {
                 tracing::error!("Application error: {msg}");
+                self.set_status_message(format!("Error: {msg}"));
             }
-            Action::Tick | Action::Render | Action::Resize(_, _) => {}
+
+            // Collection actions
+            Action::CollectionsDiscovered(nodes) => {
+                self.collections.set_collection(nodes);
+            }
+            Action::RefreshCollections => {
+                self.spawn_collection_discovery();
+            }
+            Action::SelectRequest(path) => {
+                let tx = self.action_tx.clone();
+                tokio::task::spawn_blocking(move || match repository::load_request(&path) {
+                    Ok(doc) => {
+                        let _ = tx.send(Action::RequestLoaded(Box::new(doc)));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Action::Error(e.to_string()));
+                    }
+                });
+            }
+            Action::RequestLoaded(doc) => {
+                self.request_editor.load_document(*doc);
+                self.focus = FocusTarget::RequestEditor;
+            }
+
+            // Save
+            Action::SaveRequest => {
+                self.request_editor.sync_pending_edit();
+                if let Some(doc) = self.request_editor.to_document() {
+                    if let Some(path) = doc.file_path.clone() {
+                        let tx = self.action_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            match repository::save_request(&doc, &path) {
+                                Ok(()) => {
+                                    let _ = tx.send(Action::RequestSaved(path));
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Action::Error(e.to_string()));
+                                }
+                            }
+                        });
+                    } else {
+                        self.set_status_message("Cannot save: no file path".into());
+                    }
+                }
+            }
+            Action::RequestSaved(path) => {
+                self.request_editor.set_clean();
+                self.set_status_message(format!(
+                    "Saved to {}",
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("file")
+                ));
+            }
+
+            // Execution
+            Action::SendRequest => {
+                if self.request_in_flight {
+                    return;
+                }
+                self.request_editor.sync_pending_edit();
+                if let Some(doc) = self.request_editor.to_document() {
+                    let client = self.http_client.clone();
+                    let vars = self.env_vars.clone();
+                    let tx = self.action_tx.clone();
+                    let token = CancellationToken::new();
+                    self.cancel_token = Some(token.clone());
+                    self.request_in_flight = true;
+                    self.response_viewer.set_loading();
+
+                    tokio::spawn(async move {
+                        match execution::execute_request(&client, &doc, &vars, token).await {
+                            Ok(artifact) => {
+                                let _ = tx.send(Action::RequestCompleted(Box::new(artifact)));
+                            }
+                            Err(execution::ExecutionError::Cancelled) => {
+                                let _ = tx.send(Action::RequestCancelled);
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Action::RequestFailed(e.to_string()));
+                            }
+                        }
+                    });
+                }
+            }
+            Action::CancelRequest => {
+                if let Some(token) = self.cancel_token.take() {
+                    token.cancel();
+                }
+            }
+            Action::RequestCompleted(artifact) => {
+                self.request_in_flight = false;
+                self.cancel_token = None;
+                let duration = artifact.duration_ms;
+                self.response_viewer.set_response(*artifact);
+                self.set_status_message(format!("Response received in {duration}ms"));
+            }
+            Action::RequestFailed(msg) => {
+                self.request_in_flight = false;
+                self.cancel_token = None;
+                self.response_viewer.set_error(msg);
+            }
+            Action::RequestCancelled => {
+                self.request_in_flight = false;
+                self.cancel_token = None;
+                self.response_viewer.set_cancelled();
+                self.set_status_message("Request cancelled".into());
+            }
+
+            Action::StatusMessage(msg) => {
+                self.set_status_message(msg);
+            }
+
+            Action::Tick => {
+                // Clear status message after a few ticks
+                if self.status_message.is_some() {
+                    self.status_message_ticks += 1;
+                    if self.status_message_ticks > 20 {
+                        // ~5 seconds at 250ms tick
+                        self.status_message = None;
+                        self.status_message_ticks = 0;
+                    }
+                }
+            }
+
+            Action::Render | Action::Resize(_, _) => {}
         }
     }
 
@@ -150,7 +365,38 @@ impl App {
         self.response_viewer
             .render(frame, right[1], self.focus == FocusTarget::ResponseViewer);
 
-        status_bar::render(frame, status_area, &self.focus);
+        let mode = if self.request_editor.is_editing() {
+            "INSERT"
+        } else {
+            "NORMAL"
+        };
+
+        let bar_state = StatusBarState {
+            mode,
+            is_dirty: self.request_editor.is_dirty(),
+            is_loading: self.request_in_flight,
+            status_message: self.status_message.clone(),
+        };
+
+        status_bar::render(frame, status_area, &self.focus, &bar_state);
+    }
+
+    fn set_status_message(&mut self, msg: String) {
+        self.status_message = Some(msg);
+        self.status_message_ticks = 0;
+    }
+
+    fn spawn_collection_discovery(&self) {
+        let tx = self.action_tx.clone();
+        let cwd = std::env::current_dir().unwrap_or_default();
+        tokio::task::spawn_blocking(move || match repository::discover_requests(&cwd) {
+            Ok(nodes) => {
+                let _ = tx.send(Action::CollectionsDiscovered(nodes));
+            }
+            Err(e) => {
+                let _ = tx.send(Action::Error(format!("Discovery failed: {e}")));
+            }
+        });
     }
 
     fn focused_component_mut(&mut self) -> &mut dyn Component {
@@ -183,28 +429,28 @@ mod tests {
     fn handle_key_q_returns_quit_action() {
         let mut app = make_app();
         let action = app.handle_key(key(KeyCode::Char('q')));
-        assert_eq!(action, Some(Action::Quit));
+        assert!(matches!(action, Some(Action::Quit)));
     }
 
     #[test]
     fn handle_key_ctrl_c_returns_quit_action() {
         let mut app = make_app();
         let action = app.handle_key(key_ctrl(KeyCode::Char('c')));
-        assert_eq!(action, Some(Action::Quit));
+        assert!(matches!(action, Some(Action::Quit)));
     }
 
     #[test]
     fn handle_key_tab_returns_focus_next() {
         let mut app = make_app();
         let action = app.handle_key(key(KeyCode::Tab));
-        assert_eq!(action, Some(Action::FocusNext));
+        assert!(matches!(action, Some(Action::FocusNext)));
     }
 
     #[test]
     fn handle_key_backtab_returns_focus_prev() {
         let mut app = make_app();
         let action = app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-        assert_eq!(action, Some(Action::FocusPrev));
+        assert!(matches!(action, Some(Action::FocusPrev)));
     }
 
     #[test]
@@ -217,8 +463,7 @@ mod tests {
         ));
 
         let action = app.handle_event(event);
-
-        assert_eq!(action, None);
+        assert!(action.is_none());
     }
 
     #[test]
@@ -231,8 +476,7 @@ mod tests {
         ));
 
         let action = app.handle_event(event);
-
-        assert_eq!(action, Some(Action::Quit));
+        assert!(matches!(action, Some(Action::Quit)));
     }
 
     #[test]
@@ -271,5 +515,72 @@ mod tests {
 
         app.update(Action::FocusPrev);
         assert_eq!(app.focus, FocusTarget::Collections);
+    }
+
+    #[test]
+    fn send_request_when_no_document_does_nothing() {
+        let mut app = make_app();
+        app.update(Action::SendRequest);
+        assert!(!app.request_in_flight);
+    }
+
+    #[test]
+    fn cancel_request_when_not_in_flight_is_noop() {
+        let mut app = make_app();
+        app.update(Action::CancelRequest);
+        assert!(!app.request_in_flight);
+    }
+
+    #[test]
+    fn request_completed_clears_in_flight() {
+        let mut app = make_app();
+        app.request_in_flight = true;
+
+        let artifact = crate::core::models::ResponseArtifact {
+            status_code: 200,
+            http_version: "HTTP/1.1".into(),
+            headers: vec![],
+            content_type: None,
+            content_length: None,
+            duration_ms: 100,
+            body_text: Some("ok".into()),
+        };
+
+        app.update(Action::RequestCompleted(Box::new(artifact)));
+        assert!(!app.request_in_flight);
+    }
+
+    #[test]
+    fn request_failed_clears_in_flight() {
+        let mut app = make_app();
+        app.request_in_flight = true;
+        app.update(Action::RequestFailed("timeout".into()));
+        assert!(!app.request_in_flight);
+    }
+
+    #[test]
+    fn ctrl_r_sends_request_in_normal_mode() {
+        let mut app = make_app();
+        let action = app.handle_key(key_ctrl(KeyCode::Char('r')));
+        assert!(matches!(action, Some(Action::SendRequest)));
+    }
+
+    #[test]
+    fn ctrl_s_triggers_save_in_normal_mode() {
+        let mut app = make_app();
+        let action = app.handle_key(key_ctrl(KeyCode::Char('s')));
+        assert!(matches!(action, Some(Action::SaveRequest)));
+    }
+
+    #[test]
+    fn status_message_clears_after_ticks() {
+        let mut app = make_app();
+        app.set_status_message("test".into());
+        assert!(app.status_message.is_some());
+
+        for _ in 0..21 {
+            app.update(Action::Tick);
+        }
+        assert!(app.status_message.is_none());
     }
 }

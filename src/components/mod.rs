@@ -10,7 +10,6 @@ use ratatui::layout::Rect;
 use crate::action::Action;
 
 /// Result of a component handling a key event.
-#[allow(dead_code)] // Action variant used by Component trait contract.
 pub enum EventResult {
     /// The component consumed the event.
     Consumed,
@@ -30,4 +29,10 @@ pub trait Component {
 
     /// Called when this component loses focus.
     fn blur(&mut self) {}
+
+    /// Returns true when the component is in an editing/insert mode that
+    /// should suppress global keyboard shortcuts like `q` to quit.
+    fn is_editing(&self) -> bool {
+        false
+    }
 }
