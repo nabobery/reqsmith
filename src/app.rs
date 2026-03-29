@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use color_eyre::eyre::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
@@ -15,9 +13,9 @@ use crate::components::request_editor::RequestEditorPane;
 use crate::components::response_viewer::ResponseViewerPane;
 use crate::components::status_bar::{self, StatusBarState};
 use crate::config::Config;
-use crate::core::execution;
 use crate::core::repository;
-use crate::infra::{env_loader, http_client};
+use crate::core::runner::{self, RunOptions};
+use crate::infra::http_client;
 use crate::tui::Tui;
 
 pub struct App {
@@ -35,7 +33,7 @@ pub struct App {
     // Execution state
     http_client: reqwest::Client,
     cancel_token: Option<CancellationToken>,
-    env_vars: HashMap<String, String>,
+    cwd: std::path::PathBuf,
     request_in_flight: bool,
 
     // Status
@@ -47,9 +45,7 @@ impl App {
     pub fn new(config: Config) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
 
-        // Load env and build client
         let cwd = std::env::current_dir().unwrap_or_default();
-        let env_vars = env_loader::load_env(&cwd);
         let http_client = http_client::build_client();
 
         Self {
@@ -63,7 +59,7 @@ impl App {
             action_rx,
             http_client,
             cancel_token: None,
-            env_vars,
+            cwd,
             request_in_flight: false,
             status_message: None,
             status_message_ticks: 0,
@@ -272,24 +268,27 @@ impl App {
                 self.request_editor.sync_pending_edit();
                 if let Some(doc) = self.request_editor.to_document() {
                     let client = self.http_client.clone();
-                    let vars = self.env_vars.clone();
                     let tx = self.action_tx.clone();
                     let token = CancellationToken::new();
                     self.cancel_token = Some(token.clone());
                     self.request_in_flight = true;
                     self.response_viewer.set_loading();
 
+                    let options = RunOptions {
+                        env_name: None,
+                        cli_vars: vec![],
+                        validate_before_run: false,
+                        cwd: self.cwd.clone(),
+                    };
+
                     tokio::spawn(async move {
-                        match execution::execute_request(&client, &doc, &vars, token).await {
-                            Ok(artifact) => {
-                                let _ = tx.send(Action::RequestCompleted(Box::new(artifact)));
-                            }
-                            Err(execution::ExecutionError::Cancelled) => {
-                                let _ = tx.send(Action::RequestCancelled);
-                            }
-                            Err(e) => {
-                                let _ = tx.send(Action::RequestFailed(e.to_string()));
-                            }
+                        let result = runner::run_request(&client, &doc, &options, token).await;
+                        if let Some(artifact) = result.response {
+                            let _ = tx.send(Action::RequestCompleted(Box::new(artifact)));
+                        } else if result.cancelled {
+                            let _ = tx.send(Action::RequestCancelled);
+                        } else if let Some(error) = result.error {
+                            let _ = tx.send(Action::RequestFailed(error));
                         }
                     });
                 }

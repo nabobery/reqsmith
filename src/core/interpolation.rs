@@ -123,6 +123,28 @@ pub fn interpolate_document(
     })
 }
 
+/// Extract all `{{variable}}` names from a template string.
+#[allow(dead_code)] // Used by runner and validation modules.
+pub fn extract_variable_names(template: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = template;
+
+    while let Some(start) = rest.find("{{") {
+        let after_open = &rest[start + 2..];
+        if let Some(end) = after_open.find("}}") {
+            let var_name = after_open[..end].trim();
+            if !var_name.is_empty() {
+                names.push(var_name.to_string());
+            }
+            rest = &after_open[end + 2..];
+        } else {
+            break;
+        }
+    }
+
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

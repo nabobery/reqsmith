@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -123,6 +124,120 @@ pub enum CollectionNodeKind {
     RequestFile,
 }
 
+// --- Phase 2: Environment, Validation, and Run Result models ---
+
+/// Tracks where a resolved variable came from (for diagnostics/debugging).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Used progressively across Phase 2 steps.
+pub enum VarSource {
+    OsEnv,
+    DotEnv,
+    DotEnvNamed(String),
+    HurlEnvsYml(String),
+    CliOverride,
+}
+
+impl fmt::Display for VarSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VarSource::OsEnv => write!(f, "OS environment"),
+            VarSource::DotEnv => write!(f, ".env"),
+            VarSource::DotEnvNamed(name) => write!(f, ".env.{name}"),
+            VarSource::HurlEnvsYml(name) => write!(f, "hurl_envs.yml [{name}]"),
+            VarSource::CliOverride => write!(f, "--var"),
+        }
+    }
+}
+
+/// A resolved environment with provenance tracking for each variable.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct EnvironmentSet {
+    /// The merged variable map (final resolved values).
+    pub values: HashMap<String, String>,
+    /// Source provenance for each variable (for diagnostics).
+    pub sources: HashMap<String, VarSource>,
+}
+
+/// Severity level for a validation diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ValidationSeverity {
+    Error,
+    Warning,
+}
+
+/// A single validation finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ValidationDiagnostic {
+    pub severity: ValidationSeverity,
+    pub message: String,
+    /// The field path this diagnostic relates to, e.g. "url" or "headers[0].key".
+    pub field: Option<String>,
+}
+
+/// Collection of validation diagnostics for a request document.
+#[derive(Debug, Clone, Default)]
+pub struct ValidationReport {
+    pub diagnostics: Vec<ValidationDiagnostic>,
+}
+
+#[allow(dead_code)]
+impl ValidationReport {
+    pub fn has_errors(&self) -> bool {
+        self.diagnostics
+            .iter()
+            .any(|d| d.severity == ValidationSeverity::Error)
+    }
+
+    #[allow(dead_code)]
+    pub fn has_warnings(&self) -> bool {
+        self.diagnostics
+            .iter()
+            .any(|d| d.severity == ValidationSeverity::Warning)
+    }
+
+    pub fn error_messages(&self) -> Vec<&str> {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.severity == ValidationSeverity::Error)
+            .map(|d| d.message.as_str())
+            .collect()
+    }
+}
+
+/// Exit code for headless CLI execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ExitCode {
+    Success = 0,
+    InternalError = 1,
+    ValidationFailure = 2,
+    NetworkFailure = 3,
+    #[allow(dead_code)]
+    AssertionFailure = 4, // Reserved for Phase 3
+    Interrupted = 130,
+}
+
+impl From<ExitCode> for std::process::ExitCode {
+    fn from(code: ExitCode) -> Self {
+        std::process::ExitCode::from(code as u8)
+    }
+}
+
+/// Result of executing a request (used by both TUI and CLI).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct RunResult {
+    pub request_name: String,
+    pub request_file: PathBuf,
+    pub response: Option<ResponseArtifact>,
+    pub error: Option<String>,
+    pub exit_code: ExitCode,
+    pub cancelled: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +331,85 @@ mod tests {
             CollectionNodeKind::Directory,
             CollectionNodeKind::RequestFile
         );
+    }
+
+    #[test]
+    fn validation_report_has_errors() {
+        let mut report = ValidationReport::default();
+        assert!(!report.has_errors());
+
+        report.diagnostics.push(ValidationDiagnostic {
+            severity: ValidationSeverity::Warning,
+            message: "Body present on GET".into(),
+            field: Some("body".into()),
+        });
+        assert!(!report.has_errors());
+
+        report.diagnostics.push(ValidationDiagnostic {
+            severity: ValidationSeverity::Error,
+            message: "URL is empty".into(),
+            field: Some("url".into()),
+        });
+        assert!(report.has_errors());
+    }
+
+    #[test]
+    fn validation_report_error_messages() {
+        let report = ValidationReport {
+            diagnostics: vec![
+                ValidationDiagnostic {
+                    severity: ValidationSeverity::Error,
+                    message: "missing url".into(),
+                    field: None,
+                },
+                ValidationDiagnostic {
+                    severity: ValidationSeverity::Warning,
+                    message: "body on GET".into(),
+                    field: None,
+                },
+                ValidationDiagnostic {
+                    severity: ValidationSeverity::Error,
+                    message: "empty name".into(),
+                    field: None,
+                },
+            ],
+        };
+        let errors = report.error_messages();
+        assert_eq!(errors, vec!["missing url", "empty name"]);
+    }
+
+    #[test]
+    fn exit_code_converts_to_process_exit_code() {
+        let code: std::process::ExitCode = ExitCode::Success.into();
+        // ExitCode doesn't expose its value, but we can verify the conversion compiles
+        let _ = code;
+
+        assert_eq!(ExitCode::Success as u8, 0);
+        assert_eq!(ExitCode::InternalError as u8, 1);
+        assert_eq!(ExitCode::ValidationFailure as u8, 2);
+        assert_eq!(ExitCode::NetworkFailure as u8, 3);
+        assert_eq!(ExitCode::AssertionFailure as u8, 4);
+        assert_eq!(ExitCode::Interrupted as u8, 130);
+    }
+
+    #[test]
+    fn var_source_display() {
+        assert_eq!(VarSource::DotEnv.to_string(), ".env");
+        assert_eq!(
+            VarSource::DotEnvNamed("staging".into()).to_string(),
+            ".env.staging"
+        );
+        assert_eq!(
+            VarSource::HurlEnvsYml("prod".into()).to_string(),
+            "hurl_envs.yml [prod]"
+        );
+        assert_eq!(VarSource::CliOverride.to_string(), "--var");
+    }
+
+    #[test]
+    fn environment_set_default_is_empty() {
+        let env = EnvironmentSet::default();
+        assert!(env.values.is_empty());
+        assert!(env.sources.is_empty());
     }
 }

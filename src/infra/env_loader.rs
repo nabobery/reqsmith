@@ -29,6 +29,33 @@ pub fn load_env(cwd: &Path) -> HashMap<String, String> {
     }
 }
 
+/// Load environment variables from a `.env.<name>` file in the given directory.
+///
+/// Returns an empty map if the file does not exist.
+#[allow(dead_code)] // Used by environment module in Step 3+.
+pub fn load_named_env(cwd: &Path, name: &str) -> HashMap<String, String> {
+    let env_path = cwd.join(format!(".env.{name}"));
+    if !env_path.exists() {
+        return HashMap::new();
+    }
+
+    match dotenvy::from_path_iter(&env_path) {
+        Ok(iter) => iter
+            .filter_map(|result| match result {
+                Ok((key, value)) => Some((key, value)),
+                Err(e) => {
+                    tracing::warn!("Skipping malformed .env.{name} entry: {e}");
+                    None
+                }
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!("Failed to read .env.{name} file: {e}");
+            HashMap::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,6 +89,26 @@ mod tests {
 
         let vars = load_env(tmp.path());
         assert_eq!(vars.get("MSG").unwrap(), "hello world");
+    }
+
+    #[test]
+    fn load_named_env_returns_empty_when_no_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vars = load_named_env(tmp.path(), "staging");
+        assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn load_named_env_reads_named_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join(".env.staging"),
+            "BASE_URL=https://staging.example.com\n",
+        )
+        .unwrap();
+
+        let vars = load_named_env(tmp.path(), "staging");
+        assert_eq!(vars.get("BASE_URL").unwrap(), "https://staging.example.com");
     }
 
     #[test]

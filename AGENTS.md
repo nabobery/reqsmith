@@ -2,8 +2,8 @@
 
 **Terminal-native API client** — local-first, Git-friendly alternative to Postman/Insomnia.
 
-**Generated:** 2026-03-29
-**Commit:** db31706
+**Updated:** 2026-03-29
+**Commit:** 662e9da
 **Branch:** main
 
 ## STACK
@@ -66,10 +66,12 @@ hurl/
 
 ## ANTI-PATTERNS (THIS PROJECT)
 
-- `#[allow(dead_code)]` used intentionally — variants reserved for future use
+- `#[allow(dead_code)]` used intentionally — variants reserved for future steps (Step 4+, 5, 6, 8+)
 - No `@ts-ignore` / `as any` equivalents — Rust type safety enforced
-- No blocking in event loop — use tokio::spawn or spawn_blocking
-- Never restore terminal manually — Tui::reset() is single cleanup path
+- No blocking in event loop — use `tokio::spawn` or `spawn_blocking`
+- Never restore terminal manually — `Tui::reset()` is single cleanup path
+- No `panic!` in production code — use `color_eyre::Result` for error propagation
+- `unwrap()` only in tests — production code uses `?` or explicit error handling
 
 ## COMMANDS
 

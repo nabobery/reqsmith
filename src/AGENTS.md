@@ -12,8 +12,13 @@
 | `action.rs` | State vocabulary | `Action` + `FocusTarget` enums |
 | `cli.rs` | Argument parsing | `clap` Parser (tick/frame rates) |
 | `config.rs` | App settings | CLI overrides + 250ms/16ms defaults |
-| `errors.rs` | Error handling | `HurlError` (Terminal, Io, Config) |
+| `errors.rs` | Error handling | `HurlError` (Terminal, Io, Config, ...) |
 | `logging.rs` | Tracing | Fallback: data_local → temp → .hurl/logs |
+| `output.rs` | Output formatting | Print results in JSON/YAML/text modes |
+| `components/` | UI panes | See `components/AGENTS.md` |
+| `core/` | Business logic | See `core/AGENTS.md` |
+| `commands/` | CLI subcommands | See `commands/AGENTS.md` |
+| `infra/` | Infrastructure | See `infra/AGENTS.md` |
 
 ## ROUTING & STATE
 

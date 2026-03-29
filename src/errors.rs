@@ -1,7 +1,6 @@
-/// Domain error types for hurl. Intentionally minimal in Phase 0;
-/// Phase 1 adds request, execution, and storage errors.
+/// Domain error types for hurl.
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)] // Error variants will be used in later phases.
+#[allow(dead_code)]
 pub enum HurlError {
     #[error("Terminal error: {0}")]
     Terminal(String),
@@ -11,4 +10,16 @@ pub enum HurlError {
 
     #[error("Configuration error: {0}")]
     Config(String),
+
+    #[error("Environment error: {0}")]
+    Environment(String),
+
+    #[error("Validation error: {0}")]
+    Validation(String),
+
+    #[error("Formatter error: {0}")]
+    Formatter(String),
+
+    #[error("Repository error: {0}")]
+    Repository(String),
 }

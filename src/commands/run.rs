@@ -1,0 +1,52 @@
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use tokio_util::sync::CancellationToken;
+
+use crate::cli::OutputMode;
+use crate::core::models;
+use crate::core::repository;
+use crate::core::runner::{self, RunOptions};
+use crate::output;
+
+pub async fn execute(
+    file: PathBuf,
+    env: Option<String>,
+    vars: Vec<(String, String)>,
+    output_mode: OutputMode,
+    quiet: bool,
+) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_default();
+
+    let doc = match repository::load_request(&file) {
+        Ok(doc) => doc,
+        Err(e) => {
+            eprintln!("Failed to load {}: {e}", file.display());
+            return ExitCode::from(models::ExitCode::InternalError as u8);
+        }
+    };
+
+    let options = RunOptions {
+        env_name: env,
+        cli_vars: vars,
+        validate_before_run: true,
+        cwd,
+    };
+    let client = crate::infra::http_client::build_client();
+
+    // Set up cancellation via Ctrl+C.
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            cancel_clone.cancel();
+        }
+    });
+
+    let result = runner::run_request(&client, &doc, &options, cancel).await;
+    let exit_code = result.exit_code;
+
+    output::print_run_result(&result, &output_mode, quiet);
+
+    ExitCode::from(exit_code)
+}
