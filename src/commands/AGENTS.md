@@ -1,6 +1,6 @@
 # hurl/commands
 
-**CLI Subcommand Implementations** — `run`, `fmt`, `validate`, `list`.
+**CLI Subcommand Implementations** — `run`, `fmt`, `validate`, `list`, `diff`.
 
 ## COMMAND MAP
 
@@ -10,6 +10,15 @@
 | `fmt` | `fmt.rs` | sync | Format or check formatting of request files |
 | `validate` | `validate.rs` | sync | Validate files with optional environment |
 | `list` | `list.rs` | sync | Discover and list `.hurl.yml` files |
+| `diff` | `diff.rs` | async | Compare two stored run snapshots |
+
+## DIFF COMMAND
+
+Loads two `StoredRun` files via `storage::load_run()`, converts to `ResponseArtifact` via `to_response_artifact()`, then calls `diffing::diff_responses()`. Output via `output::print_diff_result()`.
+
+```
+hurl diff <baseline.json> <candidate.json> [--json]
+```
 
 ## SHARED PATTERNS
 

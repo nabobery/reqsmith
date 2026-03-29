@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
-use crate::core::models::{CollectionNode, RequestDocument, ResponseArtifact};
+use crate::core::models::{AssertionReport, CollectionNode, RequestDocument, ResponseArtifact};
 
 /// Shared action vocabulary for state transitions across the application.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum Action {
     Tick,
@@ -27,9 +27,10 @@ pub enum Action {
     // Execution actions
     SendRequest,
     CancelRequest,
-    RequestCompleted(Box<ResponseArtifact>),
+    RequestCompleted(Box<ResponseArtifact>, Box<AssertionReport>),
     RequestFailed(String),
     RequestCancelled,
+    SaveResponseBody,
 
     // Status
     StatusMessage(String),

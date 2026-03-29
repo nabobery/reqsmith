@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde_json::Value as JsonValue;
 
 /// HTTP methods supported by hurl.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,7 +62,7 @@ fn default_enabled() -> bool {
 }
 
 /// A saved HTTP request document, serializable to/from `.hurl.yml`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestDocument {
     pub name: String,
     #[serde(default)]
@@ -73,6 +74,8 @@ pub struct RequestDocument {
     pub params: Vec<KeyValueField>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assertions: Vec<Assertion>,
     /// Runtime-only: path this document was loaded from.
     #[serde(skip)]
     pub file_path: Option<PathBuf>,
@@ -88,6 +91,7 @@ impl RequestDocument {
             headers: Vec::new(),
             params: Vec::new(),
             body: None,
+            assertions: Vec::new(),
             file_path: None,
         }
     }
@@ -104,6 +108,8 @@ pub struct ResponseArtifact {
     pub content_length: Option<u64>,
     pub duration_ms: u128,
     pub body_text: Option<String>,
+    pub body_bytes: Option<Vec<u8>>,
+    pub is_binary: bool,
 }
 
 /// A node in the collection file tree.
@@ -236,6 +242,331 @@ pub struct RunResult {
     pub error: Option<String>,
     pub exit_code: ExitCode,
     pub cancelled: bool,
+    pub assertions: AssertionReport,
+}
+
+// --- Phase 3: Assertion, Diff, and StoredRun models ---
+
+/// A single assertion to evaluate against a response.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::enum_variant_names)]
+pub enum Assertion {
+    ExpectStatus(u16),
+    ExpectTimeUnder(u64),
+    ExpectBodyPath {
+        path: String,
+        operator: AssertionOperator,
+        expected: JsonValue,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "wire variants intentionally mirror the public assertion keys"
+)]
+enum AssertionWire {
+    ExpectStatus { expect_status: u16 },
+    ExpectTimeUnder { expect_time_under: Milliseconds },
+    ExpectBodyPath { expect_body_path: BodyPathAssertion },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct BodyPathAssertion {
+    path: String,
+    operator: AssertionOperator,
+    expected: JsonValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Milliseconds(u64);
+
+impl Serialize for Milliseconds {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&format!("{}ms", self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Milliseconds {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct MillisecondsVisitor;
+
+        impl<'de> de::Visitor<'de> for MillisecondsVisitor {
+            type Value = Milliseconds;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an integer millisecond value or a string ending in 'ms'")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(Milliseconds(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let value =
+                    u64::try_from(value).map_err(|_| E::custom("milliseconds must be >= 0"))?;
+                Ok(Milliseconds(value))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let raw = value.trim();
+                if let Some(stripped) = raw.strip_suffix("ms") {
+                    let millis = stripped
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|_| E::custom("invalid millisecond value"))?;
+                    return Ok(Milliseconds(millis));
+                }
+
+                let millis = raw
+                    .parse::<u64>()
+                    .map_err(|_| E::custom("expected integer milliseconds or '<n>ms'"))?;
+                Ok(Milliseconds(millis))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_str(&value)
+            }
+        }
+
+        deserializer.deserialize_any(MillisecondsVisitor)
+    }
+}
+
+impl Serialize for Assertion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let wire = match self {
+            Assertion::ExpectStatus(code) => AssertionWire::ExpectStatus {
+                expect_status: *code,
+            },
+            Assertion::ExpectTimeUnder(ms) => AssertionWire::ExpectTimeUnder {
+                expect_time_under: Milliseconds(*ms),
+            },
+            Assertion::ExpectBodyPath {
+                path,
+                operator,
+                expected,
+            } => AssertionWire::ExpectBodyPath {
+                expect_body_path: BodyPathAssertion {
+                    path: path.clone(),
+                    operator: operator.clone(),
+                    expected: expected.clone(),
+                },
+            },
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Assertion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AssertionWire::deserialize(deserializer)?;
+        Ok(match wire {
+            AssertionWire::ExpectStatus { expect_status } => Assertion::ExpectStatus(expect_status),
+            AssertionWire::ExpectTimeUnder { expect_time_under } => {
+                Assertion::ExpectTimeUnder(expect_time_under.0)
+            }
+            AssertionWire::ExpectBodyPath { expect_body_path } => Assertion::ExpectBodyPath {
+                path: expect_body_path.path,
+                operator: expect_body_path.operator,
+                expected: expect_body_path.expected,
+            },
+        })
+    }
+}
+
+impl fmt::Display for Assertion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Assertion::ExpectStatus(code) => write!(f, "expect_status: {code}"),
+            Assertion::ExpectTimeUnder(ms) => write!(f, "expect_time_under: {ms}ms"),
+            Assertion::ExpectBodyPath {
+                path,
+                operator,
+                expected,
+            } => write!(f, "expect_body_path: {path} {operator} {expected}"),
+        }
+    }
+}
+
+/// Comparison operators for body-path assertions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssertionOperator {
+    Eq,
+    Ne,
+    Gt,
+    Lt,
+    Gte,
+    Lte,
+    Contains,
+    Exists,
+}
+
+impl fmt::Display for AssertionOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            AssertionOperator::Eq => "==",
+            AssertionOperator::Ne => "!=",
+            AssertionOperator::Gt => ">",
+            AssertionOperator::Lt => "<",
+            AssertionOperator::Gte => ">=",
+            AssertionOperator::Lte => "<=",
+            AssertionOperator::Contains => "contains",
+            AssertionOperator::Exists => "exists",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Result of evaluating a single assertion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssertionResult {
+    pub assertion: Assertion,
+    pub passed: bool,
+    pub message: String,
+    pub actual_value: Option<String>,
+}
+
+/// Collection of assertion results for a request run.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AssertionReport {
+    pub results: Vec<AssertionResult>,
+}
+
+#[allow(dead_code)]
+impl AssertionReport {
+    pub fn all_passed(&self) -> bool {
+        self.results.iter().all(|r| r.passed)
+    }
+
+    pub fn failures(&self) -> Vec<&AssertionResult> {
+        self.results.iter().filter(|r| !r.passed).collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.results.is_empty()
+    }
+
+    pub fn pass_count(&self) -> usize {
+        self.results.iter().filter(|r| r.passed).count()
+    }
+
+    pub fn fail_count(&self) -> usize {
+        self.results.iter().filter(|r| !r.passed).count()
+    }
+}
+
+/// A serializable snapshot of a completed run, for diffing and history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct StoredRun {
+    pub request_name: String,
+    pub request_file: PathBuf,
+    pub timestamp: String,
+    pub status_code: u16,
+    pub duration_ms: u128,
+    pub headers: Vec<(String, String)>,
+    pub content_type: Option<String>,
+    pub body_text: Option<String>,
+    pub assertions: Vec<AssertionResult>,
+}
+
+#[allow(dead_code)]
+impl StoredRun {
+    pub fn from_run_result(result: &RunResult) -> Option<Self> {
+        let response = result.response.as_ref()?;
+        Some(StoredRun {
+            request_name: result.request_name.clone(),
+            request_file: result.request_file.clone(),
+            timestamp: chrono_like_timestamp(),
+            status_code: response.status_code,
+            duration_ms: response.duration_ms,
+            headers: response.headers.clone(),
+            content_type: response.content_type.clone(),
+            body_text: response.body_text.clone(),
+            assertions: result.assertions.results.clone(),
+        })
+    }
+
+    pub fn to_response_artifact(&self) -> ResponseArtifact {
+        ResponseArtifact {
+            status_code: self.status_code,
+            http_version: String::new(),
+            headers: self.headers.clone(),
+            content_type: self.content_type.clone(),
+            content_length: None,
+            duration_ms: self.duration_ms,
+            body_text: self.body_text.clone(),
+            body_bytes: None,
+            is_binary: false,
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn chrono_like_timestamp() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}", now.as_millis())
+}
+
+/// Representation of a diff between two responses.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct DiffArtifact {
+    pub baseline_label: String,
+    pub candidate_label: String,
+    pub status_diff: Option<(u16, u16)>,
+    pub header_diffs: Vec<HeaderDiff>,
+    pub body_diff: Vec<DiffLine>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum HeaderDiff {
+    Added(String, String),
+    Removed(String, String),
+    Changed {
+        key: String,
+        old: String,
+        new: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum DiffLine {
+    Equal(String),
+    Insert(String),
+    Delete(String),
 }
 
 #[cfg(test)]
@@ -280,6 +611,7 @@ mod tests {
             }],
             params: vec![],
             body: Some("{ \"name\": \"test\" }".into()),
+            assertions: vec![],
             file_path: Some("/tmp/test.hurl.yml".into()),
         };
 
@@ -304,6 +636,7 @@ mod tests {
             headers: vec![],
             params: vec![],
             body: None,
+            assertions: vec![],
             file_path: None,
         };
 
@@ -322,6 +655,37 @@ mod tests {
         assert!(doc.headers.is_empty());
         assert!(doc.params.is_empty());
         assert_eq!(doc.body, None);
+    }
+
+    #[test]
+    fn request_document_deserializes_documented_assertion_yaml() {
+        let yaml = r#"
+name: "Create New User"
+method: POST
+url: "{{base_url}}/api/v1/users"
+assertions:
+  - expect_status: 201
+  - expect_time_under: 500ms
+  - expect_body_path:
+      path: "$.user.id"
+      operator: eq
+      expected: 42
+"#;
+
+        let doc: RequestDocument = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(
+            doc.assertions,
+            vec![
+                Assertion::ExpectStatus(201),
+                Assertion::ExpectTimeUnder(500),
+                Assertion::ExpectBodyPath {
+                    path: "$.user.id".into(),
+                    operator: AssertionOperator::Eq,
+                    expected: serde_json::json!(42),
+                },
+            ]
+        );
     }
 
     #[test]

@@ -9,6 +9,13 @@ use super::models::{HttpMethod, RequestDocument, ResponseArtifact};
 /// Maximum response body size to read into memory (10 MB).
 const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 
+/// Heuristic: treat a response as binary if >5% of the first 8 KiB are null bytes.
+fn is_likely_binary(bytes: &[u8]) -> bool {
+    let sample = &bytes[..bytes.len().min(8192)];
+    let null_count = sample.iter().filter(|&&b| b == 0).count();
+    null_count > sample.len() / 20 // >5% null bytes
+}
+
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
 pub enum ExecutionError {
@@ -126,7 +133,14 @@ pub async fn execute_request(
         body_bytes.extend_from_slice(&chunk);
     }
 
-    let body_text = if truncated {
+    let binary = is_likely_binary(&body_bytes);
+
+    let body_text = if binary {
+        let len = body_bytes.len();
+        Some(format!(
+            "[Binary response: {len} bytes. Press 'w' to save to disk.]"
+        ))
+    } else if truncated {
         let truncated = String::from_utf8_lossy(&body_bytes);
         Some(format!(
             "{truncated}\n\n[truncated at {MAX_BODY_SIZE} bytes]"
@@ -155,6 +169,8 @@ pub async fn execute_request(
         content_length,
         duration_ms,
         body_text,
+        body_bytes: binary.then_some(body_bytes),
+        is_binary: binary,
     })
 }
 
@@ -188,6 +204,7 @@ mod tests {
             headers: vec![],
             params: vec![],
             body: None,
+            assertions: vec![],
             file_path: None,
         }
     }
@@ -264,6 +281,7 @@ mod tests {
                 },
             ],
             body: None,
+            assertions: vec![],
             file_path: None,
         };
         let token = CancellationToken::new();

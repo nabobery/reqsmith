@@ -2,7 +2,8 @@ use std::path::Path;
 
 use crate::cli::OutputMode;
 use crate::core::models::{
-    CollectionNode, CollectionNodeKind, ExitCode, RunResult, ValidationReport, ValidationSeverity,
+    AssertionReport, CollectionNode, CollectionNodeKind, DiffArtifact, DiffLine, ExitCode,
+    HeaderDiff, RunResult, ValidationReport, ValidationSeverity,
 };
 
 /// Print the result of running a request.
@@ -40,10 +41,32 @@ fn print_run_human(result: &RunResult) {
             println!("{body}");
         }
     }
+
+    if !result.assertions.is_empty() {
+        print_assertions_human(&result.assertions);
+    }
+}
+
+fn print_assertions_human(report: &AssertionReport) {
+    let passed = report.pass_count();
+    let failed = report.fail_count();
+
+    println!();
+    println!("Assertions: {passed} passed, {failed} failed");
+
+    for r in &report.results {
+        let label = if r.passed { "PASS" } else { "FAIL" };
+        let assertion_display = format!("{}", r.assertion);
+        if let Some(actual) = &r.actual_value {
+            println!("  {label}  {assertion_display} (actual: {actual})");
+        } else {
+            println!("  {label}  {assertion_display}");
+        }
+    }
 }
 
 fn print_run_json(result: &RunResult) {
-    let json = serde_json::json!({
+    let mut json = serde_json::json!({
         "request_name": result.request_name,
         "request_file": result.request_file.display().to_string(),
         "exit_code": result.exit_code as u8,
@@ -61,6 +84,120 @@ fn print_run_json(result: &RunResult) {
             })).collect::<Vec<_>>(),
             "body": r.body_text,
         })),
+    });
+
+    if !result.assertions.is_empty() {
+        let assertions: Vec<serde_json::Value> = result
+            .assertions
+            .results
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "type": format!("{}", r.assertion),
+                    "passed": r.passed,
+                    "message": r.message,
+                    "actual_value": r.actual_value,
+                })
+            })
+            .collect();
+        json.as_object_mut()
+            .unwrap()
+            .insert("assertions".into(), serde_json::Value::Array(assertions));
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json).unwrap_or_default()
+    );
+}
+
+/// Print the result of diffing two stored runs.
+#[allow(dead_code)]
+pub fn print_diff_result(diff: &DiffArtifact, mode: &OutputMode) {
+    match mode {
+        OutputMode::Human => print_diff_human(diff),
+        OutputMode::Json => print_diff_json(diff),
+    }
+}
+
+fn print_diff_human(diff: &DiffArtifact) {
+    println!("--- baseline: {}", diff.baseline_label);
+    println!("+++ candidate: {}", diff.candidate_label);
+    println!();
+
+    if let Some((old_status, new_status)) = diff.status_diff {
+        println!("Status: {old_status} -> {new_status}");
+        println!();
+    }
+
+    if !diff.header_diffs.is_empty() {
+        println!("Headers:");
+        for hd in &diff.header_diffs {
+            match hd {
+                HeaderDiff::Added(key, val) => println!("  + {key}: {val}"),
+                HeaderDiff::Removed(key, val) => println!("  - {key}: {val}"),
+                HeaderDiff::Changed { key, old, new } => println!("  ~ {key}: {old} -> {new}"),
+            }
+        }
+        println!();
+    }
+
+    let has_body_changes = diff
+        .body_diff
+        .iter()
+        .any(|l| matches!(l, DiffLine::Insert(_) | DiffLine::Delete(_)));
+    if has_body_changes {
+        println!("Body:");
+        for line in &diff.body_diff {
+            match line {
+                DiffLine::Equal(s) => print!("  {s}"),
+                DiffLine::Insert(s) => print!("  +{s}"),
+                DiffLine::Delete(s) => print!("  -{s}"),
+            }
+        }
+        // Ensure trailing newline
+        println!();
+    }
+}
+
+fn print_diff_json(diff: &DiffArtifact) {
+    let status = diff
+        .status_diff
+        .map(|(old, new)| serde_json::json!({ "old": old, "new": new }));
+
+    let headers: Vec<serde_json::Value> = diff
+        .header_diffs
+        .iter()
+        .map(|hd| match hd {
+            HeaderDiff::Added(key, val) => {
+                serde_json::json!({ "type": "added", "key": key, "value": val })
+            }
+            HeaderDiff::Removed(key, val) => {
+                serde_json::json!({ "type": "removed", "key": key, "value": val })
+            }
+            HeaderDiff::Changed { key, old, new } => {
+                serde_json::json!({ "type": "changed", "key": key, "old": old, "new": new })
+            }
+        })
+        .collect();
+
+    let body_lines: Vec<serde_json::Value> = diff
+        .body_diff
+        .iter()
+        .filter(|l| !matches!(l, DiffLine::Equal(_)))
+        .map(|l| match l {
+            DiffLine::Insert(s) => serde_json::json!({ "type": "insert", "line": s }),
+            DiffLine::Delete(s) => serde_json::json!({ "type": "delete", "line": s }),
+            DiffLine::Equal(_) => unreachable!(),
+        })
+        .collect();
+
+    let json = serde_json::json!({
+        "baseline": diff.baseline_label,
+        "candidate": diff.candidate_label,
+        "status_diff": status,
+        "header_diffs": headers,
+        "body_diffs": body_lines,
     });
 
     println!(
@@ -169,7 +306,7 @@ fn collect_file_paths(nodes: &[CollectionNode]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::models::ResponseArtifact;
+    use crate::core::models::{Assertion, AssertionOperator, AssertionResult, ResponseArtifact};
     use std::path::PathBuf;
 
     #[test]
@@ -185,10 +322,13 @@ mod tests {
                 content_length: Some(42),
                 duration_ms: 150,
                 body_text: Some("{\"ok\": true}".into()),
+                body_bytes: None,
+                is_binary: false,
             }),
             error: None,
             exit_code: ExitCode::Success,
             cancelled: false,
+            assertions: AssertionReport::default(),
         };
 
         // Just verify no panic and JSON is valid
@@ -249,14 +389,95 @@ mod tests {
                 content_length: None,
                 duration_ms: 10,
                 body_text: None,
+                body_bytes: None,
+                is_binary: false,
             }),
             error: None,
             exit_code: ExitCode::Success,
             cancelled: false,
+            assertions: AssertionReport::default(),
         };
 
         // In quiet mode with success, print_run_result should return early
         // (testing by not panicking is sufficient here)
         print_run_result(&result, &OutputMode::Human, true);
+    }
+
+    #[test]
+    fn print_run_human_shows_assertion_output() {
+        let result = RunResult {
+            request_name: "Create User".into(),
+            request_file: PathBuf::from("create_user.hurl.yml"),
+            response: Some(ResponseArtifact {
+                status_code: 201,
+                http_version: "HTTP/1.1".into(),
+                headers: vec![],
+                content_type: Some("application/json".into()),
+                content_length: None,
+                duration_ms: 45,
+                body_text: Some("{\"user\":{\"id\":99}}".into()),
+                body_bytes: None,
+                is_binary: false,
+            }),
+            error: None,
+            exit_code: ExitCode::AssertionFailure,
+            cancelled: false,
+            assertions: AssertionReport {
+                results: vec![
+                    AssertionResult {
+                        assertion: Assertion::ExpectStatus(201),
+                        passed: true,
+                        message: "status is 201".into(),
+                        actual_value: None,
+                    },
+                    AssertionResult {
+                        assertion: Assertion::ExpectTimeUnder(500),
+                        passed: true,
+                        message: "response time under 500ms".into(),
+                        actual_value: Some("45ms".into()),
+                    },
+                    AssertionResult {
+                        assertion: Assertion::ExpectBodyPath {
+                            path: "$.user.id".into(),
+                            operator: AssertionOperator::Eq,
+                            expected: serde_json::json!(42),
+                        },
+                        passed: false,
+                        message: "body path mismatch".into(),
+                        actual_value: Some("99".into()),
+                    },
+                ],
+            },
+        };
+
+        // Verify no panic and assertion report is printed.
+        // We call print_run_human directly; output goes to stdout.
+        print_run_human(&result);
+    }
+
+    #[test]
+    fn print_run_human_no_assertions_when_empty() {
+        let result = RunResult {
+            request_name: "Simple".into(),
+            request_file: PathBuf::from("simple.hurl.yml"),
+            response: Some(ResponseArtifact {
+                status_code: 200,
+                http_version: "HTTP/1.1".into(),
+                headers: vec![],
+                content_type: None,
+                content_length: None,
+                duration_ms: 10,
+                body_text: None,
+                body_bytes: None,
+                is_binary: false,
+            }),
+            error: None,
+            exit_code: ExitCode::Success,
+            cancelled: false,
+            assertions: AssertionReport::default(),
+        };
+
+        // Should not panic and should not print assertion section
+        print_run_human(&result);
     }
 }

@@ -15,6 +15,7 @@ pub async fn execute(
     vars: Vec<(String, String)>,
     output_mode: OutputMode,
     quiet: bool,
+    save: bool,
 ) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
 
@@ -47,6 +48,18 @@ pub async fn execute(
     let exit_code = result.exit_code;
 
     output::print_run_result(&result, &output_mode, quiet);
+
+    if save {
+        if let Some(stored) = models::StoredRun::from_run_result(&result) {
+            let save_dir = std::env::current_dir().unwrap_or_default();
+            match crate::core::storage::save_run(&stored, &save_dir) {
+                Ok(path) => eprintln!("Run saved to {}", path.display()),
+                Err(e) => eprintln!("Failed to save run: {e}"),
+            }
+        } else {
+            eprintln!("No response to save (request may have failed)");
+        }
+    }
 
     ExitCode::from(exit_code)
 }

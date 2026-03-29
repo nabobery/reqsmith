@@ -2,10 +2,11 @@ use std::path::PathBuf;
 
 use tokio_util::sync::CancellationToken;
 
+use super::assertions;
 use super::environment::{apply_os_env_fallback, resolve_environment};
 use super::execution::{self, ExecutionError};
 use super::interpolation::extract_variable_names;
-use super::models::{ExitCode, RequestDocument, RunResult};
+use super::models::{AssertionReport, ExitCode, RequestDocument, RunResult};
 use super::validation::validate_document;
 
 /// Options controlling how a request is run.
@@ -46,6 +47,7 @@ pub async fn run_request(
                 error: Some(e.to_string()),
                 exit_code: ExitCode::InternalError,
                 cancelled: false,
+                assertions: AssertionReport::default(),
             };
         }
     };
@@ -66,20 +68,34 @@ pub async fn run_request(
                 error: Some(errors),
                 exit_code: ExitCode::ValidationFailure,
                 cancelled: false,
+                assertions: AssertionReport::default(),
             };
         }
     }
 
     // 4. Execute.
     match execution::execute_request(client, doc, &env.values, cancel).await {
-        Ok(artifact) => RunResult {
-            request_name,
-            request_file,
-            response: Some(artifact),
-            error: None,
-            exit_code: ExitCode::Success,
-            cancelled: false,
-        },
+        Ok(artifact) => {
+            let assertion_report = if doc.assertions.is_empty() {
+                AssertionReport::default()
+            } else {
+                assertions::evaluate_assertions(&doc.assertions, &artifact)
+            };
+            let exit_code = if assertion_report.all_passed() {
+                ExitCode::Success
+            } else {
+                ExitCode::AssertionFailure
+            };
+            RunResult {
+                request_name,
+                request_file,
+                response: Some(artifact),
+                error: None,
+                exit_code,
+                cancelled: false,
+                assertions: assertion_report,
+            }
+        }
         Err(ExecutionError::Cancelled) => RunResult {
             request_name,
             request_file,
@@ -87,6 +103,7 @@ pub async fn run_request(
             error: None,
             exit_code: ExitCode::Interrupted,
             cancelled: true,
+            assertions: AssertionReport::default(),
         },
         Err(ExecutionError::Network(msg)) => RunResult {
             request_name,
@@ -95,6 +112,7 @@ pub async fn run_request(
             error: Some(msg),
             exit_code: ExitCode::NetworkFailure,
             cancelled: false,
+            assertions: AssertionReport::default(),
         },
         Err(ExecutionError::Interpolation(vars)) => RunResult {
             request_name,
@@ -103,6 +121,7 @@ pub async fn run_request(
             error: Some(format!("Unresolved variables: {}", vars.join(", "))),
             exit_code: ExitCode::ValidationFailure,
             cancelled: false,
+            assertions: AssertionReport::default(),
         },
         Err(e) => RunResult {
             request_name,
@@ -111,6 +130,7 @@ pub async fn run_request(
             error: Some(e.to_string()),
             exit_code: ExitCode::InternalError,
             cancelled: false,
+            assertions: AssertionReport::default(),
         },
     }
 }
@@ -157,6 +177,7 @@ mod tests {
             headers: vec![],
             params: vec![],
             body: None,
+            assertions: vec![],
             file_path: Some(PathBuf::from("test.hurl.yml")),
         }
     }
@@ -188,6 +209,7 @@ mod tests {
                 enabled: true,
             }],
             body: Some("{{body_content}}".into()),
+            assertions: vec![],
             file_path: None,
         };
 
@@ -275,6 +297,7 @@ mod tests {
             headers: vec![],
             params: vec![],
             body: None,
+            assertions: vec![],
             file_path: Some(nested.join("test.hurl.yml")),
         };
 

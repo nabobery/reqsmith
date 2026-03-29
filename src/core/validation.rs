@@ -2,10 +2,11 @@ use std::str::FromStr;
 
 use reqwest::Url;
 use reqwest::header::HeaderName;
+use serde_json_path::JsonPath;
 
 use super::interpolation::{extract_variable_names, interpolate};
 use super::models::{
-    EnvironmentSet, HttpMethod, RequestDocument, ValidationDiagnostic, ValidationReport,
+    Assertion, EnvironmentSet, HttpMethod, RequestDocument, ValidationDiagnostic, ValidationReport,
     ValidationSeverity,
 };
 
@@ -96,6 +97,9 @@ pub fn validate_document(doc: &RequestDocument, env: Option<&EnvironmentSet>) ->
         }
     }
 
+    // Assertion checks.
+    diagnostics.extend(validate_assertions(&doc.assertions));
+
     if let Some(url_for_validation) = interpolate_url_for_validation(&doc.url, env) {
         match Url::parse(&url_for_validation) {
             Ok(_) => {}
@@ -118,6 +122,49 @@ pub fn validate_document(doc: &RequestDocument, env: Option<&EnvironmentSet>) ->
     }
 
     ValidationReport { diagnostics }
+}
+
+/// Validate assertions for schema correctness.
+fn validate_assertions(assertions: &[Assertion]) -> Vec<ValidationDiagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for (i, assertion) in assertions.iter().enumerate() {
+        match assertion {
+            Assertion::ExpectBodyPath { path, .. } => {
+                if let Err(err) = JsonPath::parse(path) {
+                    diagnostics.push(ValidationDiagnostic {
+                        severity: ValidationSeverity::Error,
+                        message: format!("Assertion at index {i} has invalid JSONPath: {err}"),
+                        field: Some(format!("assertions[{i}].path")),
+                    });
+                }
+            }
+            Assertion::ExpectTimeUnder(ms) => {
+                if *ms < 1 {
+                    diagnostics.push(ValidationDiagnostic {
+                        severity: ValidationSeverity::Warning,
+                        message: format!(
+                            "Assertion at index {i}: time threshold {ms}ms is unreasonably low"
+                        ),
+                        field: Some(format!("assertions[{i}]")),
+                    });
+                }
+            }
+            Assertion::ExpectStatus(code) => {
+                if *code < 100 || *code > 599 {
+                    diagnostics.push(ValidationDiagnostic {
+                        severity: ValidationSeverity::Warning,
+                        message: format!(
+                            "Assertion at index {i}: status code {code} is outside the valid 100-599 range"
+                        ),
+                        field: Some(format!("assertions[{i}]")),
+                    });
+                }
+            }
+        }
+    }
+
+    diagnostics
 }
 
 fn interpolate_url_for_validation(
@@ -146,7 +193,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::core::models::KeyValueField;
+    use crate::core::models::{AssertionOperator, KeyValueField};
 
     fn simple_doc() -> RequestDocument {
         RequestDocument {
@@ -156,6 +203,7 @@ mod tests {
             headers: vec![],
             params: vec![],
             body: None,
+            assertions: vec![],
             file_path: None,
         }
     }
@@ -321,9 +369,45 @@ mod tests {
             }],
             params: vec![],
             body: None,
+            assertions: vec![],
             file_path: None,
         };
         let report = validate_document(&doc, None);
         assert!(report.diagnostics.len() >= 3);
+    }
+
+    #[test]
+    fn invalid_jsonpath_is_error() {
+        let mut doc = simple_doc();
+        doc.assertions = vec![Assertion::ExpectBodyPath {
+            path: "$[invalid~~path".into(),
+            operator: AssertionOperator::Eq,
+            expected: serde_json::json!("value"),
+        }];
+        let report = validate_document(&doc, None);
+        assert!(report.has_errors());
+        assert!(
+            report
+                .error_messages()
+                .iter()
+                .any(|m| m.contains("JSONPath"))
+        );
+    }
+
+    #[test]
+    fn valid_assertions_pass() {
+        let mut doc = simple_doc();
+        doc.assertions = vec![
+            Assertion::ExpectStatus(200),
+            Assertion::ExpectTimeUnder(5000),
+            Assertion::ExpectBodyPath {
+                path: "$.data.id".into(),
+                operator: AssertionOperator::Eq,
+                expected: serde_json::json!(1),
+            },
+        ];
+        let report = validate_document(&doc, None);
+        assert!(!report.has_errors());
+        assert!(!report.has_warnings());
     }
 }

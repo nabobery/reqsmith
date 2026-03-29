@@ -5,7 +5,7 @@ use super::repository;
 
 /// Format a `RequestDocument` into canonical YAML with deterministic key ordering.
 ///
-/// Field order: name, method, url, headers (sorted by key), params (sorted by key), body.
+/// Field order: name, method, url, headers (sorted by key), params (sorted by key), body, assertions.
 /// Empty collections are omitted.
 pub fn format_document(doc: &RequestDocument) -> String {
     let mut lines = Vec::new();
@@ -48,6 +48,19 @@ pub fn format_document(doc: &RequestDocument) -> String {
             }
         } else {
             lines.push(format!("body: {:?}", body));
+        }
+    }
+
+    if !doc.assertions.is_empty() {
+        let yaml =
+            serde_yaml::to_string(&doc.assertions).expect("assertions should serialize to YAML");
+        // Prefix with the key and indent the serialized block under it.
+        lines.push("assertions:".into());
+        for line in yaml.lines() {
+            if line == "---" {
+                continue;
+            }
+            lines.push(format!("  {line}"));
         }
     }
 
@@ -100,6 +113,7 @@ mod tests {
             headers: vec![],
             params: vec![],
             body: None,
+            assertions: vec![],
             file_path: None,
         }
     }
@@ -141,6 +155,7 @@ mod tests {
                 enabled: true,
             }],
             body: Some("{\"name\": \"test\"}".into()),
+            assertions: vec![],
             file_path: None,
         };
 
@@ -171,6 +186,7 @@ mod tests {
             ],
             params: vec![],
             body: None,
+            assertions: vec![],
             file_path: None,
         };
 
@@ -189,6 +205,7 @@ mod tests {
             headers: vec![],
             params: vec![],
             body: Some("line1\nline2\nline3".into()),
+            assertions: vec![],
             file_path: None,
         };
 
@@ -211,6 +228,7 @@ mod tests {
             }],
             params: vec![],
             body: None,
+            assertions: vec![],
             file_path: None,
         };
 
@@ -244,5 +262,75 @@ mod tests {
 
         format_file(&path).unwrap();
         assert!(is_formatted(&path).unwrap());
+    }
+
+    #[test]
+    fn format_preserves_assertions() {
+        use crate::core::models::{Assertion, AssertionOperator};
+
+        let doc = RequestDocument {
+            name: "Assert Test".into(),
+            method: HttpMethod::Get,
+            url: "https://example.com/api".into(),
+            headers: vec![],
+            params: vec![],
+            body: None,
+            assertions: vec![
+                Assertion::ExpectStatus(200),
+                Assertion::ExpectTimeUnder(500),
+                Assertion::ExpectBodyPath {
+                    path: "$.name".into(),
+                    operator: AssertionOperator::Eq,
+                    expected: serde_json::Value::String("alice".into()),
+                },
+            ],
+            file_path: None,
+        };
+
+        let output = format_document(&doc);
+        assert!(
+            output.contains("assertions:"),
+            "Output should contain assertions section"
+        );
+        assert!(output.contains("- expect_status: 200"));
+        assert!(output.contains("- expect_time_under: 500ms"));
+        assert!(output.contains("- expect_body_path:"));
+        assert!(output.contains("path: $.name"));
+        assert!(output.contains("operator: eq"));
+        assert!(output.contains("expected: alice"));
+
+        // Round-trip: parse back and verify assertions are preserved
+        let reparsed: RequestDocument = serde_yaml::from_str(&output).unwrap();
+        assert_eq!(reparsed.assertions.len(), 3);
+        assert_eq!(reparsed.assertions[0], Assertion::ExpectStatus(200));
+        assert_eq!(reparsed.assertions[1], Assertion::ExpectTimeUnder(500));
+        assert_eq!(
+            reparsed.assertions[2],
+            Assertion::ExpectBodyPath {
+                path: "$.name".into(),
+                operator: AssertionOperator::Eq,
+                expected: serde_json::Value::String("alice".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn format_omits_empty_assertions() {
+        let doc = RequestDocument {
+            name: "No Assertions".into(),
+            method: HttpMethod::Get,
+            url: "https://example.com".into(),
+            headers: vec![],
+            params: vec![],
+            body: None,
+            assertions: vec![],
+            file_path: None,
+        };
+
+        let output = format_document(&doc);
+        assert!(
+            !output.contains("assertions"),
+            "Empty assertions should not appear in formatted output"
+        );
     }
 }

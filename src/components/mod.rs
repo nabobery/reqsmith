@@ -1,4 +1,5 @@
 pub mod collections;
+pub mod json_tree;
 pub mod request_editor;
 pub mod response_viewer;
 pub mod status_bar;

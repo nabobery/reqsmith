@@ -83,13 +83,20 @@ async fn run_command(cmd: cli::Command) -> ExitCode {
             vars,
             output,
             quiet,
-        } => commands::run::execute(file, env, vars, output, quiet).await,
+            save,
+        } => commands::run::execute(file, env, vars, output, quiet, save).await,
 
         cli::Command::Fmt { files, check } => commands::fmt::execute(files, check),
 
         cli::Command::Validate { files, env, output } => {
             commands::validate::execute(files, env, output)
         }
+
+        cli::Command::Diff {
+            baseline,
+            candidate,
+            output,
+        } => commands::diff::execute(baseline, candidate, output).await,
 
         cli::Command::List { path, output } => commands::list::execute(path, output),
     }

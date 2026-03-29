@@ -44,6 +44,10 @@ pub enum Command {
         /// Suppress all output except errors
         #[arg(short, long)]
         quiet: bool,
+
+        /// Persist the run result to .hurl/runs/ for later diffing
+        #[arg(long)]
+        save: bool,
     },
 
     /// Format request files with canonical YAML ordering
@@ -65,6 +69,17 @@ pub enum Command {
         #[arg(short, long)]
         env: Option<String>,
 
+        /// Output format
+        #[arg(short, long, default_value = "human")]
+        output: OutputMode,
+    },
+
+    /// Compare two stored run files
+    Diff {
+        /// Baseline stored run file
+        baseline: PathBuf,
+        /// Candidate stored run file
+        candidate: PathBuf,
         /// Output format
         #[arg(short, long, default_value = "human")]
         output: OutputMode,
@@ -146,12 +161,14 @@ mod tests {
                 ref vars,
                 ref output,
                 quiet,
+                save,
             }) => {
                 assert_eq!(file, &PathBuf::from("requests/test.hurl.yml"));
                 assert_eq!(env.as_deref(), Some("staging"));
                 assert_eq!(vars, &[("token".to_string(), "abc123".to_string())]);
                 assert_eq!(output, &OutputMode::Json);
                 assert!(quiet);
+                assert!(!save);
             }
             _ => panic!("expected Run subcommand"),
         }

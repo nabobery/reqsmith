@@ -13,8 +13,10 @@ use crate::components::request_editor::RequestEditorPane;
 use crate::components::response_viewer::ResponseViewerPane;
 use crate::components::status_bar::{self, StatusBarState};
 use crate::config::Config;
+use crate::core::models::ResponseArtifact;
 use crate::core::repository;
 use crate::core::runner::{self, RunOptions};
+use crate::core::storage;
 use crate::infra::http_client;
 use crate::tui::Tui;
 
@@ -35,6 +37,9 @@ pub struct App {
     cancel_token: Option<CancellationToken>,
     cwd: std::path::PathBuf,
     request_in_flight: bool,
+
+    // Response history for diffing
+    previous_response: Option<ResponseArtifact>,
 
     // Status
     status_message: Option<String>,
@@ -61,6 +66,7 @@ impl App {
             cancel_token: None,
             cwd,
             request_in_flight: false,
+            previous_response: None,
             status_message: None,
             status_message_ticks: 0,
         }
@@ -284,7 +290,10 @@ impl App {
                     tokio::spawn(async move {
                         let result = runner::run_request(&client, &doc, &options, token).await;
                         if let Some(artifact) = result.response {
-                            let _ = tx.send(Action::RequestCompleted(Box::new(artifact)));
+                            let _ = tx.send(Action::RequestCompleted(
+                                Box::new(artifact),
+                                Box::new(result.assertions),
+                            ));
                         } else if result.cancelled {
                             let _ = tx.send(Action::RequestCancelled);
                         } else if let Some(error) = result.error {
@@ -298,11 +307,18 @@ impl App {
                     token.cancel();
                 }
             }
-            Action::RequestCompleted(artifact) => {
+            Action::RequestCompleted(artifact, assertions) => {
                 self.request_in_flight = false;
                 self.cancel_token = None;
                 let duration = artifact.duration_ms;
-                self.response_viewer.set_response(*artifact);
+                // Save current response as previous for diffing
+                let prev = self.response_viewer.take_response();
+                self.previous_response = prev;
+                self.response_viewer.set_response_with_diff(
+                    *artifact,
+                    *assertions,
+                    self.previous_response.as_ref(),
+                );
                 self.set_status_message(format!("Response received in {duration}ms"));
             }
             Action::RequestFailed(msg) => {
@@ -315,6 +331,30 @@ impl App {
                 self.cancel_token = None;
                 self.response_viewer.set_cancelled();
                 self.set_status_message("Request cancelled".into());
+            }
+            Action::SaveResponseBody => {
+                let Some(bytes) = self.response_viewer.binary_body_bytes().map(|b| b.to_vec())
+                else {
+                    self.set_status_message("No binary response body available to save".into());
+                    return;
+                };
+
+                let cwd = self.cwd.clone();
+                let tx = self.action_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    match storage::save_response_body(&bytes, &cwd) {
+                        Ok(path) => {
+                            let _ = tx.send(Action::StatusMessage(format!(
+                                "Saved response body to {}",
+                                path.display()
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(Action::Error(format!("Failed to save response body: {e}")));
+                        }
+                    }
+                });
             }
 
             Action::StatusMessage(msg) => {
@@ -543,9 +583,14 @@ mod tests {
             content_length: None,
             duration_ms: 100,
             body_text: Some("ok".into()),
+            body_bytes: None,
+            is_binary: false,
         };
 
-        app.update(Action::RequestCompleted(Box::new(artifact)));
+        app.update(Action::RequestCompleted(
+            Box::new(artifact),
+            Box::<crate::core::models::AssertionReport>::default(),
+        ));
         assert!(!app.request_in_flight);
     }
 

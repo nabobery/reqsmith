@@ -206,6 +206,7 @@ impl RequestEditorPane {
             headers,
             params,
             body,
+            assertions: doc.assertions.clone(),
             file_path: doc.file_path.clone(),
         })
     }
@@ -941,6 +942,7 @@ mod tests {
                 enabled: true,
             }],
             body: Some("{\"name\": \"test\"}".into()),
+            assertions: vec![],
             file_path: Some("/tmp/test.hurl.yml".into()),
         }
     }
