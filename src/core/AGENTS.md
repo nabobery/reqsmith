@@ -10,6 +10,7 @@
 | `repository.rs` | File I/O | Discover `.hurl.yml` via `walkdir`, atomic writes via `.tmp` rename |
 | `interpolation.rs` | Template engine | `{{var}}` resolution, returns `Vec<String>` of unresolved vars |
 | `execution.rs` | HTTP client | `reqwest::Client`, `CancellationToken` support, 10MB body cap |
+| `runner.rs` | Request execution | Shared pipeline: env → interpolate → validate → execute → assert |
 | `assertions.rs` | Response assertions | `evaluate_assertions()` with JSONPath, status, timing checks |
 | `diffing.rs` | Response diffing | `diff_responses()` using `similar::TextDiff`, JSON normalization |
 | `storage.rs` | Run persistence | Save/load `StoredRun` to `.hurl/runs/`, body downloads to `.hurl/downloads/` |
@@ -20,13 +21,28 @@
 ## DATA FLOW
 
 ```
-RequestDocument → interpolate_document → execute_request → ResponseArtifact
-                  (resolve {{vars}})      (reqwest + cancel)
+RequestDocument → resolve_environment → interpolate_document → execute_request → ResponseArtifact
+                  (OS env + .env +      (resolve {{vars}})      (reqwest + cancel)
+                   hurl_envs.yml)
                          ↓
               evaluate_assertions(response) → AssertionReport
                          ↓
               store: save_run(StoredRun) → .hurl/runs/{name}_{ts}.json
 ```
+
+### Runner Pipeline (`runner.rs`)
+
+The `run_request()` function orchestrates:
+1. Resolve environment (OS env, .env files, CLI vars)
+2. Apply OS env fallback for referenced variables
+3. Optional pre-flight validation
+4. Interpolate `{{variables}}` in document
+5. (plugins) Pre-request mutation hooks
+6. (plugins) Authentication hooks
+7. Execute HTTP request
+8. (plugins) Post-response inspection hooks
+9. Evaluate assertions
+10. Return `RunResult` with exit code
 
 ## ASSERTION TYPES
 
@@ -58,6 +74,7 @@ RequestDocument → interpolate_document → execute_request → ResponseArtifac
 - **Async**: All execution functions are `async`, use `tokio::select!` for cancellation
 - **Body limit**: Hard cap at 10MB (`MAX_BODY_SIZE`), truncates with marker
 - **Dead code**: `#[allow(dead_code)]` on modules reserved for future CLI steps
+- **Plugins**: `#[cfg(feature = "plugins")]` gates all plugin integration points
 
 ## FILE DISCOVERY
 
@@ -71,3 +88,4 @@ RequestDocument → interpolate_document → execute_request → ResponseArtifac
 - **Add a diff field**: Add to `DiffArtifact`, update `diff_*` function, output in `print_diff_*`
 - **Add storage**: Use `next_available_path()` for collision-safe filenames
 - **Test validation**: Use `validate_document(doc, env)` with `ValidationReport`
+- **Plugin hooks**: Runner integrates via `plugins::hooks::{run_pre_request, run_authenticate, run_post_response, provide_variable}`

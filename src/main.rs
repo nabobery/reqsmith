@@ -9,6 +9,8 @@ mod errors;
 mod infra;
 mod logging;
 mod output;
+#[cfg(feature = "plugins")]
+mod plugins;
 mod tui;
 
 use std::process::ExitCode;
@@ -99,5 +101,11 @@ async fn run_command(cmd: cli::Command) -> ExitCode {
         } => commands::diff::execute(baseline, candidate, output).await,
 
         cli::Command::List { path, output } => commands::list::execute(path, output),
+
+        #[cfg(feature = "plugins")]
+        cli::Command::Plugin { action } => match action {
+            cli::PluginAction::List => commands::plugin::execute_list(),
+            cli::PluginAction::Info { name } => commands::plugin::execute_info(name),
+        },
     }
 }

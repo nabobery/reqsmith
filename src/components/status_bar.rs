@@ -13,6 +13,7 @@ pub struct StatusBarState {
     pub is_dirty: bool,
     pub is_loading: bool,
     pub status_message: Option<String>,
+    pub plugin_count: usize,
 }
 
 pub fn render(frame: &mut Frame, area: Rect, focus: &FocusTarget, state: &StatusBarState) {
@@ -46,6 +47,16 @@ pub fn render(frame: &mut Frame, area: Rect, focus: &FocusTarget, state: &Status
         indicators.push(Span::styled(
             " [sending...] ",
             Style::default().fg(Color::Cyan),
+        ));
+    }
+    if state.plugin_count > 0 {
+        indicators.push(Span::styled(
+            format!(
+                " [{} plugin{}] ",
+                state.plugin_count,
+                if state.plugin_count == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(Color::DarkGray),
         ));
     }
 

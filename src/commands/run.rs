@@ -27,11 +27,26 @@ pub async fn execute(
         }
     };
 
+    #[cfg(feature = "plugins")]
+    let plugin_registry = match crate::plugins::registry::PluginRegistry::discover_and_load(&cwd) {
+        Ok(r) if !r.is_empty() => {
+            eprintln!("Loaded {} plugin(s)", r.len());
+            Some(std::sync::Arc::new(r))
+        }
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("Warning: plugin loading failed: {e}");
+            None
+        }
+    };
+
     let options = RunOptions {
         env_name: env,
         cli_vars: vars,
         validate_before_run: true,
         cwd,
+        #[cfg(feature = "plugins")]
+        plugin_registry,
     };
     let client = crate::infra::http_client::build_client();
 

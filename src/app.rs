@@ -44,6 +44,10 @@ pub struct App {
     // Status
     status_message: Option<String>,
     status_message_ticks: u32,
+
+    // Plugin registry
+    #[cfg(feature = "plugins")]
+    plugin_registry: Option<std::sync::Arc<crate::plugins::registry::PluginRegistry>>,
 }
 
 impl App {
@@ -52,6 +56,20 @@ impl App {
 
         let cwd = std::env::current_dir().unwrap_or_default();
         let http_client = http_client::build_client();
+
+        #[cfg(feature = "plugins")]
+        let plugin_registry =
+            match crate::plugins::registry::PluginRegistry::discover_and_load(&cwd) {
+                Ok(r) if !r.is_empty() => {
+                    tracing::info!("Loaded {} plugin(s)", r.len());
+                    Some(std::sync::Arc::new(r))
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!("Plugin loading failed: {e}");
+                    None
+                }
+            };
 
         Self {
             config,
@@ -69,6 +87,8 @@ impl App {
             previous_response: None,
             status_message: None,
             status_message_ticks: 0,
+            #[cfg(feature = "plugins")]
+            plugin_registry,
         }
     }
 
@@ -285,6 +305,8 @@ impl App {
                         cli_vars: vec![],
                         validate_before_run: false,
                         cwd: self.cwd.clone(),
+                        #[cfg(feature = "plugins")]
+                        plugin_registry: self.plugin_registry.clone(),
                     };
 
                     tokio::spawn(async move {
@@ -410,11 +432,22 @@ impl App {
             "NORMAL"
         };
 
+        let plugin_count = {
+            #[cfg(feature = "plugins")]
+            {
+                self.plugin_registry.as_ref().map_or(0, |r| r.len())
+            }
+            #[cfg(not(feature = "plugins"))]
+            {
+                0
+            }
+        };
         let bar_state = StatusBarState {
             mode,
             is_dirty: self.request_editor.is_dirty(),
             is_loading: self.request_in_flight,
             status_message: self.status_message.clone(),
+            plugin_count,
         };
 
         status_bar::render(frame, status_area, &self.focus, &bar_state);

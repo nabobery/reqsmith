@@ -18,6 +18,7 @@
 | `components/` | UI panes | See `components/AGENTS.md` |
 | `core/` | Business logic | See `core/AGENTS.md` |
 | `commands/` | CLI subcommands | See `commands/AGENTS.md` |
+| `plugins/` | WASM plugin system | See `plugins/AGENTS.md` |
 | `infra/` | Infrastructure | See `infra/AGENTS.md` |
 
 ## ROUTING & STATE

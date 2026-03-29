@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+#[cfg(feature = "plugins")]
+pub use plugin_cli::PluginAction;
+
 /// Terminal-native API client.
 #[derive(Parser, Debug)]
 #[command(name = "hurl", version, about)]
@@ -95,6 +98,29 @@ pub enum Command {
         #[arg(short, long, default_value = "human")]
         output: OutputMode,
     },
+
+    /// Manage plugins
+    #[cfg(feature = "plugins")]
+    Plugin {
+        #[command(subcommand)]
+        action: PluginAction,
+    },
+}
+
+#[cfg(feature = "plugins")]
+mod plugin_cli {
+    use clap::Subcommand;
+
+    #[derive(Subcommand, Debug)]
+    pub enum PluginAction {
+        /// List discovered plugins and their status
+        List,
+        /// Show detailed info about a specific plugin
+        Info {
+            /// Plugin name
+            name: String,
+        },
+    }
 }
 
 /// Output mode for CLI commands.

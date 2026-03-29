@@ -4,6 +4,7 @@
 
 **Updated:** 2026-03-29
 **Branch:** main
+**Features:** `plugins` (extism WASM)
 
 ## STACK
 
@@ -34,9 +35,10 @@ hurl/
 │   ├── errors.rs          # HurlError enum (Terminal, Io, Config)
 │   ├── logging.rs         # File-based tracing with fallback directories
 │   ├── output.rs          # Human/JSON output for run results, diffs, validation
-│   ├── commands/          # CLI subcommands (run, fmt, validate, list, diff)
+│   ├── commands/          # CLI subcommands (run, fmt, validate, list, diff, plugin)
 │   ├── components/        # TUI panes (collections, request_editor, response_viewer, json_tree)
-│   ├── core/              # Business logic (models, assertions, diffing, storage, validation)
+│   ├── core/              # Business logic (models, runner, assertions, diffing, storage, validation)
+│   ├── plugins/           # WASM plugin system (extism, hooks, host functions)
 │   └── infra/             # Infrastructure (http_client, env_loader)
 ├── docs/
 │   ├── specs/             # Technical specification
@@ -64,7 +66,10 @@ hurl/
 | Run storage | `src/core/storage.rs` | Save/load runs to .hurl/runs/, body downloads |
 | Document validation | `src/core/validation.rs` | Schema + interpolation + assertion checks |
 | CLI diff command | `src/commands/diff.rs` | Compare two stored runs |
+| CLI plugin command | `src/commands/plugin.rs` | List/info for WASM plugins |
 | Output formatting | `src/output.rs` | Human/JSON for run, diff, validation, list |
+| Request runner | `src/core/runner.rs` | Shared execution pipeline (TUI + CLI) |
+| Plugin system | `src/plugins/` | Extism WASM plugin registry, hooks, host functions |
 
 ## CONVENTIONS
 
@@ -79,12 +84,12 @@ hurl/
 
 ## ANTI-PATTERNS (THIS PROJECT)
 
-- No `@ts-ignore` / `as any` equivalents — Rust type safety enforced
 - No blocking in event loop — use `tokio::spawn` or `spawn_blocking`
 - Never restore terminal manually — `Tui::reset()` is single cleanup path
 - No `panic!` in production code — use `color_eyre::Result` for error propagation
 - `unwrap()` only in tests — production code uses `?` or explicit error handling
 - Don't suppress clippy warnings without documented reason
+- No type suppression (`as any`, `@ts-ignore` equivalents) — Rust type safety enforced
 
 ## COMMANDS
 
@@ -104,3 +109,5 @@ just watch       # cargo watch -x 'clippy --all-targets -- -D warnings' -x test
 - `render` and `tick` intervals are independent (frame_rate vs tick_rate)
 - Run snapshots stored in `.hurl/runs/`, binary bodies in `.hurl/downloads/`
 - Assertion YAML format: `expect_status`, `expect_time_under: 500ms`, `expect_body_path`
+- Plugin system uses `extism` WASM — gated behind `plugins` feature flag
+- Plugin config: `.hurl/plugins.toml` or `$XDG_CONFIG_HOME/hurl/plugins.toml`

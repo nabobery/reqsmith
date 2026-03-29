@@ -74,6 +74,8 @@ pub struct RequestDocument {
     pub params: Vec<KeyValueField>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_plugin: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assertions: Vec<Assertion>,
     /// Runtime-only: path this document was loaded from.
@@ -91,6 +93,7 @@ impl RequestDocument {
             headers: Vec::new(),
             params: Vec::new(),
             body: None,
+            auth_plugin: None,
             assertions: Vec::new(),
             file_path: None,
         }
@@ -141,6 +144,8 @@ pub enum VarSource {
     DotEnvNamed(String),
     HurlEnvsYml(String),
     CliOverride,
+    #[cfg(feature = "plugins")]
+    Plugin,
 }
 
 impl fmt::Display for VarSource {
@@ -151,6 +156,8 @@ impl fmt::Display for VarSource {
             VarSource::DotEnvNamed(name) => write!(f, ".env.{name}"),
             VarSource::HurlEnvsYml(name) => write!(f, "hurl_envs.yml [{name}]"),
             VarSource::CliOverride => write!(f, "--var"),
+            #[cfg(feature = "plugins")]
+            VarSource::Plugin => write!(f, "plugin"),
         }
     }
 }
@@ -611,6 +618,7 @@ mod tests {
             }],
             params: vec![],
             body: Some("{ \"name\": \"test\" }".into()),
+            auth_plugin: None,
             assertions: vec![],
             file_path: Some("/tmp/test.hurl.yml".into()),
         };
@@ -636,6 +644,7 @@ mod tests {
             headers: vec![],
             params: vec![],
             body: None,
+            auth_plugin: None,
             assertions: vec![],
             file_path: None,
         };

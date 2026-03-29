@@ -1,6 +1,6 @@
 # hurl/commands
 
-**CLI Subcommand Implementations** — `run`, `fmt`, `validate`, `list`, `diff`.
+**CLI Subcommand Implementations** — `run`, `fmt`, `validate`, `list`, `diff`, `plugin`.
 
 ## COMMAND MAP
 
@@ -11,6 +11,8 @@
 | `validate` | `validate.rs` | sync | Validate files with optional environment |
 | `list` | `list.rs` | sync | Discover and list `.hurl.yml` files |
 | `diff` | `diff.rs` | async | Compare two stored run snapshots |
+| `plugin list` | `plugin.rs` | sync | List discovered plugins with status and capabilities |
+| `plugin info` | `plugin.rs` | sync | Show detailed info for a specific plugin |
 
 ## DIFF COMMAND
 
@@ -18,6 +20,15 @@ Loads two `StoredRun` files via `storage::load_run()`, converts to `ResponseArti
 
 ```
 hurl diff <baseline.json> <candidate.json> [--json]
+```
+
+## PLUGIN COMMAND
+
+Discovers plugins from `.hurl/plugins.toml`, displays status (loaded/disabled/missing_wasm), capabilities, and config. Requires `plugins` feature flag.
+
+```
+hurl plugin list              # Show all configured plugins
+hurl plugin info <name>       # Detailed info for one plugin
 ```
 
 ## SHARED PATTERNS

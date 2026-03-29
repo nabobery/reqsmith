@@ -204,6 +204,7 @@ mod tests {
             headers: vec![],
             params: vec![],
             body: None,
+            auth_plugin: None,
             assertions: vec![],
             file_path: None,
         }
@@ -281,6 +282,7 @@ mod tests {
                 },
             ],
             body: None,
+            auth_plugin: None,
             assertions: vec![],
             file_path: None,
         };

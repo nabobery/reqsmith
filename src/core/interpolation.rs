@@ -119,6 +119,7 @@ pub fn interpolate_document(
         headers,
         params,
         body,
+        auth_plugin: doc.auth_plugin.clone(),
         assertions: doc.assertions.clone(),
         file_path: doc.file_path.clone(),
     })
@@ -231,6 +232,7 @@ mod tests {
                 enabled: true,
             }],
             body: Some("{\"env\": \"{{env}}\"}".into()),
+            auth_plugin: None,
             assertions: vec![],
             file_path: None,
         };
@@ -258,6 +260,7 @@ mod tests {
             headers: vec![],
             params: vec![],
             body: Some("{{missing_body_var}}".into()),
+            auth_plugin: None,
             assertions: vec![],
             file_path: None,
         };

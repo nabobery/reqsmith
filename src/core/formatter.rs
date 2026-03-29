@@ -5,7 +5,8 @@ use super::repository;
 
 /// Format a `RequestDocument` into canonical YAML with deterministic key ordering.
 ///
-/// Field order: name, method, url, headers (sorted by key), params (sorted by key), body, assertions.
+/// Field order: name, method, url, headers (sorted by key), params (sorted by key), body,
+/// auth_plugin, assertions.
 /// Empty collections are omitted.
 pub fn format_document(doc: &RequestDocument) -> String {
     let mut lines = Vec::new();
@@ -49,6 +50,10 @@ pub fn format_document(doc: &RequestDocument) -> String {
         } else {
             lines.push(format!("body: {:?}", body));
         }
+    }
+
+    if let Some(auth_plugin) = &doc.auth_plugin {
+        lines.push(format!("auth_plugin: {:?}", auth_plugin));
     }
 
     if !doc.assertions.is_empty() {
@@ -113,6 +118,7 @@ mod tests {
             headers: vec![],
             params: vec![],
             body: None,
+            auth_plugin: None,
             assertions: vec![],
             file_path: None,
         }
@@ -155,6 +161,7 @@ mod tests {
                 enabled: true,
             }],
             body: Some("{\"name\": \"test\"}".into()),
+            auth_plugin: None,
             assertions: vec![],
             file_path: None,
         };
@@ -186,6 +193,7 @@ mod tests {
             ],
             params: vec![],
             body: None,
+            auth_plugin: None,
             assertions: vec![],
             file_path: None,
         };
@@ -205,6 +213,7 @@ mod tests {
             headers: vec![],
             params: vec![],
             body: Some("line1\nline2\nline3".into()),
+            auth_plugin: None,
             assertions: vec![],
             file_path: None,
         };
@@ -228,12 +237,14 @@ mod tests {
             }],
             params: vec![],
             body: None,
+            auth_plugin: Some("aws-sigv4".into()),
             assertions: vec![],
             file_path: None,
         };
 
         let output = format_document(&doc);
         assert!(output.contains("enabled: false"));
+        assert!(output.contains("auth_plugin: \"aws-sigv4\""));
     }
 
     #[test]
@@ -275,6 +286,7 @@ mod tests {
             headers: vec![],
             params: vec![],
             body: None,
+            auth_plugin: None,
             assertions: vec![
                 Assertion::ExpectStatus(200),
                 Assertion::ExpectTimeUnder(500),
@@ -323,6 +335,7 @@ mod tests {
             headers: vec![],
             params: vec![],
             body: None,
+            auth_plugin: None,
             assertions: vec![],
             file_path: None,
         };

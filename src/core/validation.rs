@@ -32,6 +32,16 @@ pub fn validate_document(doc: &RequestDocument, env: Option<&EnvironmentSet>) ->
         });
     }
 
+    if let Some(auth_plugin) = &doc.auth_plugin {
+        if auth_plugin.trim().is_empty() {
+            diagnostics.push(ValidationDiagnostic {
+                severity: ValidationSeverity::Error,
+                message: "auth_plugin must not be empty when present".into(),
+                field: Some("auth_plugin".into()),
+            });
+        }
+    }
+
     // Header key checks.
     for (i, header) in doc.headers.iter().enumerate() {
         if header.key.trim().is_empty() {
@@ -203,6 +213,7 @@ mod tests {
             headers: vec![],
             params: vec![],
             body: None,
+            auth_plugin: None,
             assertions: vec![],
             file_path: None,
         }
@@ -241,6 +252,22 @@ mod tests {
         let report = validate_document(&doc, None);
         assert!(report.has_errors());
         assert!(report.error_messages().iter().any(|m| m.contains("URL")));
+    }
+
+    #[test]
+    fn empty_auth_plugin_is_error() {
+        let mut doc = simple_doc();
+        doc.auth_plugin = Some(String::new());
+
+        let report = validate_document(&doc, None);
+
+        assert!(report.has_errors());
+        assert!(
+            report
+                .error_messages()
+                .iter()
+                .any(|m| m.contains("auth_plugin"))
+        );
     }
 
     #[test]
@@ -369,6 +396,7 @@ mod tests {
             }],
             params: vec![],
             body: None,
+            auth_plugin: None,
             assertions: vec![],
             file_path: None,
         };

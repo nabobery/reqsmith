@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use super::assertions;
 use super::environment::{apply_os_env_fallback, resolve_environment};
 use super::execution::{self, ExecutionError};
-use super::interpolation::extract_variable_names;
+use super::interpolation::{extract_variable_names, interpolate_document};
 use super::models::{AssertionReport, ExitCode, RequestDocument, RunResult};
 use super::validation::validate_document;
 
@@ -16,6 +16,8 @@ pub struct RunOptions {
     pub cli_vars: Vec<(String, String)>,
     pub validate_before_run: bool,
     pub cwd: PathBuf,
+    #[cfg(feature = "plugins")]
+    pub plugin_registry: Option<std::sync::Arc<crate::plugins::registry::PluginRegistry>>,
 }
 
 /// Run a request through the shared execution pipeline.
@@ -56,6 +58,25 @@ pub async fn run_request(
     let referenced_vars = extract_variable_names_from_doc(doc);
     apply_os_env_fallback(&mut env, &referenced_vars);
 
+    // 2.5. Variable provider: resolve remaining unresolved vars via plugins.
+    #[cfg(feature = "plugins")]
+    if let Some(registry) = &options.plugin_registry {
+        let still_missing: Vec<String> = referenced_vars
+            .iter()
+            .filter(|v| !env.values.contains_key(*v))
+            .cloned()
+            .collect();
+        for var_name in still_missing {
+            if let Some(value) =
+                crate::plugins::hooks::provide_variable(registry, &var_name, &env.values).await
+            {
+                env.values.insert(var_name.clone(), value);
+                env.sources
+                    .insert(var_name, super::models::VarSource::Plugin);
+            }
+        }
+    }
+
     // 3. Optional pre-flight validation.
     if options.validate_before_run {
         let report = validate_document(doc, Some(&env));
@@ -73,13 +94,157 @@ pub async fn run_request(
         }
     }
 
+    let prepared_doc = match interpolate_document(doc, &env.values) {
+        Ok(doc) => doc,
+        Err(vars) => {
+            return RunResult {
+                request_name,
+                request_file,
+                response: None,
+                error: Some(format!("Unresolved variables: {}", vars.join(", "))),
+                exit_code: ExitCode::ValidationFailure,
+                cancelled: false,
+                assertions: AssertionReport::default(),
+            };
+        }
+    };
+
+    // 3.5. Pre-request mutation hook: plugins may modify the request.
+    #[cfg(feature = "plugins")]
+    let prepared_doc = {
+        let mut prepared_doc = prepared_doc;
+
+        if let Some(registry) = &options.plugin_registry {
+            let ctx = crate::plugins::models::HookContext::from_document(
+                &prepared_doc,
+                options.env_name.as_deref(),
+            );
+            let mutated_ctx =
+                crate::plugins::hooks::run_pre_request(registry, ctx, &env.values).await;
+            let hook_result = crate::plugins::models::HookResult {
+                method: Some(mutated_ctx.method),
+                url: Some(mutated_ctx.url),
+                headers: Some(mutated_ctx.headers),
+                params: Some(mutated_ctx.params),
+                body: mutated_ctx.body,
+                error: None,
+            };
+            prepared_doc = hook_result.apply_to_document(&prepared_doc);
+        }
+
+        // 3.6. Authentication hook: plugins add auth headers.
+        if let Some(registry) = &options.plugin_registry {
+            let selected_auth_plugin =
+                prepared_doc.auth_plugin.as_deref().and_then(|plugin_name| {
+                    registry.plugin_named_with_capability(
+                        plugin_name,
+                        &crate::plugins::models::PluginCapability::Authenticate,
+                    )
+                });
+            let auth_req = crate::plugins::models::AuthRequest {
+                auth_type: prepared_doc.auth_plugin.clone().unwrap_or_default(),
+                config: selected_auth_plugin
+                    .map(|plugin| plugin.entry.flat_config())
+                    .unwrap_or_default(),
+                method: prepared_doc.method.to_string(),
+                url: prepared_doc.url.clone(),
+                headers: prepared_doc
+                    .headers
+                    .iter()
+                    .filter(|h| h.enabled)
+                    .map(|h| (h.key.clone(), h.value.clone()))
+                    .collect(),
+                body: prepared_doc.body.clone(),
+            };
+            if prepared_doc.auth_plugin.is_some() && selected_auth_plugin.is_none() {
+                return RunResult {
+                    request_name,
+                    request_file,
+                    response: None,
+                    error: Some(format!(
+                        "Auth plugin '{}' is not available",
+                        prepared_doc.auth_plugin.as_deref().unwrap_or_default()
+                    )),
+                    exit_code: ExitCode::ValidationFailure,
+                    cancelled: false,
+                    assertions: AssertionReport::default(),
+                };
+            }
+            if let Some(auth_result) =
+                crate::plugins::hooks::run_authenticate(registry, auth_req, &env.values).await
+            {
+                let mut owned = prepared_doc.clone();
+                for (key, value) in auth_result.headers {
+                    owned.headers.push(super::models::KeyValueField {
+                        key,
+                        value,
+                        enabled: true,
+                    });
+                }
+                prepared_doc = owned;
+            } else if let Some(auth_plugin) = &prepared_doc.auth_plugin {
+                return RunResult {
+                    request_name,
+                    request_file,
+                    response: None,
+                    error: Some(format!(
+                        "Auth plugin '{}' did not provide authentication headers",
+                        auth_plugin
+                    )),
+                    exit_code: ExitCode::ValidationFailure,
+                    cancelled: false,
+                    assertions: AssertionReport::default(),
+                };
+            }
+        } else if let Some(auth_plugin) = &prepared_doc.auth_plugin {
+            return RunResult {
+                request_name,
+                request_file,
+                response: None,
+                error: Some(format!("Auth plugin '{}' is not available", auth_plugin)),
+                exit_code: ExitCode::ValidationFailure,
+                cancelled: false,
+                assertions: AssertionReport::default(),
+            };
+        }
+
+        prepared_doc
+    };
+
+    #[cfg(not(feature = "plugins"))]
+    if let Some(auth_plugin) = &prepared_doc.auth_plugin {
+        return RunResult {
+            request_name,
+            request_file,
+            response: None,
+            error: Some(format!(
+                "Auth plugin '{}' requires a build with plugin support enabled",
+                auth_plugin
+            )),
+            exit_code: ExitCode::ValidationFailure,
+            cancelled: false,
+            assertions: AssertionReport::default(),
+        };
+    }
+
     // 4. Execute.
-    match execution::execute_request(client, doc, &env.values, cancel).await {
+    match execution::execute_request(client, &prepared_doc, &env.values, cancel).await {
         Ok(artifact) => {
-            let assertion_report = if doc.assertions.is_empty() {
+            // 4.5. Post-response inspection hook.
+            #[cfg(feature = "plugins")]
+            let artifact = if let Some(registry) = &options.plugin_registry {
+                let resp_ctx = crate::plugins::models::ResponseContext::from_artifact(&artifact);
+                let mutated =
+                    crate::plugins::hooks::run_post_response(registry, resp_ctx, &env.values).await;
+                mutated.apply_to_artifact(artifact)
+            } else {
+                artifact
+            };
+
+            let assertion_report = if prepared_doc.assertions.is_empty() {
                 AssertionReport::default()
             } else {
-                assertions::evaluate_assertions(&doc.assertions, &artifact)
+                assertions::evaluate_assertions(&prepared_doc.assertions, &artifact)
             };
             let exit_code = if assertion_report.all_passed() {
                 ExitCode::Success
@@ -177,6 +342,7 @@ mod tests {
             headers: vec![],
             params: vec![],
             body: None,
+            auth_plugin: None,
             assertions: vec![],
             file_path: Some(PathBuf::from("test.hurl.yml")),
         }
@@ -188,6 +354,8 @@ mod tests {
             cli_vars: vec![],
             validate_before_run: false,
             cwd: cwd.to_path_buf(),
+            #[cfg(feature = "plugins")]
+            plugin_registry: None,
         }
     }
 
@@ -209,6 +377,7 @@ mod tests {
                 enabled: true,
             }],
             body: Some("{{body_content}}".into()),
+            auth_plugin: None,
             assertions: vec![],
             file_path: None,
         };
@@ -233,6 +402,8 @@ mod tests {
             cli_vars: vec![],
             validate_before_run: false,
             cwd: tmp.path().to_path_buf(),
+            #[cfg(feature = "plugins")]
+            plugin_registry: None,
         };
 
         let client = reqwest::Client::new();
@@ -275,6 +446,8 @@ mod tests {
             cli_vars: vec![("base_url".into(), "http://127.0.0.1:9".into())],
             validate_before_run: false,
             cwd: tmp.path().to_path_buf(),
+            #[cfg(feature = "plugins")]
+            plugin_registry: None,
         };
 
         let client = reqwest::Client::new();
@@ -297,6 +470,7 @@ mod tests {
             headers: vec![],
             params: vec![],
             body: None,
+            auth_plugin: None,
             assertions: vec![],
             file_path: Some(nested.join("test.hurl.yml")),
         };
@@ -306,6 +480,8 @@ mod tests {
             cli_vars: vec![],
             validate_before_run: true,
             cwd: std::env::temp_dir(),
+            #[cfg(feature = "plugins")]
+            plugin_registry: None,
         };
 
         let client = reqwest::Client::new();
@@ -326,5 +502,24 @@ mod tests {
         assert!(result.cancelled);
         assert_eq!(result.exit_code, ExitCode::Interrupted);
         assert!(result.response.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_request_requires_explicit_auth_plugin_to_be_available() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut doc = simple_doc("https://example.com/api");
+        doc.auth_plugin = Some("aws-sigv4".into());
+        let options = default_options(tmp.path());
+
+        let client = reqwest::Client::new();
+        let result = run_request(&client, &doc, &options, CancellationToken::new()).await;
+
+        assert_eq!(result.exit_code, ExitCode::ValidationFailure);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("aws-sigv4"))
+        );
     }
 }

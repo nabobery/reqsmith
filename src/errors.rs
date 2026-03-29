@@ -22,4 +22,8 @@ pub enum HurlError {
 
     #[error("Repository error: {0}")]
     Repository(String),
+
+    #[cfg(feature = "plugins")]
+    #[error("Plugin error: {0}")]
+    Plugin(String),
 }

@@ -263,6 +263,7 @@ mod tests {
             }],
             params: vec![],
             body: Some("body content".into()),
+            auth_plugin: None,
             assertions: vec![],
             file_path: None,
         };
