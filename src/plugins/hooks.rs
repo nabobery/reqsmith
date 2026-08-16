@@ -199,10 +199,10 @@ pub async fn provide_variable(
                         );
                         continue;
                     }
-                    if let Some(value) = result.value {
-                        if !value.is_empty() {
-                            return Some(value);
-                        }
+                    if let Some(value) = result.value
+                        && !value.is_empty()
+                    {
+                        return Some(value);
                     }
                 }
                 Err(e) => {

@@ -73,10 +73,10 @@ impl HookResult {
     /// Apply mutations from the hook result onto a cloned `RequestDocument`.
     pub fn apply_to_document(&self, doc: &RequestDocument) -> RequestDocument {
         let mut out = doc.clone();
-        if let Some(ref method) = self.method {
-            if let Some(m) = parse_method(method) {
-                out.method = m;
-            }
+        if let Some(ref method) = self.method
+            && let Some(m) = parse_method(method)
+        {
+            out.method = m;
         }
         if let Some(ref url) = self.url {
             out.url = url.clone();

@@ -1,4 +1,4 @@
-# hurl development commands
+# reqsmith development commands
 
 # List available recipes
 default:

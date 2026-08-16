@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use super::atomic_write;
 use super::models::{KeyValueField, RequestDocument};
 use super::repository;
 
@@ -92,7 +93,11 @@ pub fn format_file(path: &Path) -> Result<bool, FormatterError> {
     if formatted == current {
         return Ok(false);
     }
-    std::fs::write(path, &formatted).map_err(|e| FormatterError::Io(e.to_string()))?;
+    // Atomic, symlink-refusing overwrite via the shared writer rather than a
+    // bare `std::fs::write` (which would follow a symlinked request file and
+    // could leave a half-written file on interruption).
+    atomic_write::write_replace(path, formatted.as_bytes())
+        .map_err(|e| FormatterError::Io(e.to_string()))?;
     Ok(true)
 }
 
@@ -250,7 +255,7 @@ mod tests {
     #[test]
     fn format_file_writes_and_reports_change() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("test.hurl.yml");
+        let path = tmp.path().join("test.req.yml");
 
         // Write unformatted YAML (different key order than canonical)
         std::fs::write(&path, "url: https://example.com\nname: Test\nmethod: GET\n").unwrap();
@@ -266,7 +271,7 @@ mod tests {
     #[test]
     fn is_formatted_detects_unformatted() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("test.hurl.yml");
+        let path = tmp.path().join("test.req.yml");
         std::fs::write(&path, "url: https://example.com\nname: Test\nmethod: GET\n").unwrap();
 
         assert!(!is_formatted(&path).unwrap());

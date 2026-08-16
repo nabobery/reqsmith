@@ -5,6 +5,7 @@ use crate::core::models::{
     AssertionReport, CollectionNode, CollectionNodeKind, DiffArtifact, DiffLine, ExitCode,
     HeaderDiff, RunResult, ValidationReport, ValidationSeverity,
 };
+use crate::core::redaction;
 
 /// Print the result of running a request.
 #[allow(dead_code)] // Used in Step 8.
@@ -65,7 +66,11 @@ fn print_assertions_human(report: &AssertionReport) {
     }
 }
 
-fn print_run_json(result: &RunResult) {
+/// Build the JSON representation of a run result. Response headers are
+/// routed through [`redaction::redact_headers`] so secrets (e.g. a
+/// `Set-Cookie` the server returned) never reach stdout. Split out from
+/// [`print_run_json`] so the redaction behavior is directly unit-testable.
+fn build_run_json(result: &RunResult) -> serde_json::Value {
     let mut json = serde_json::json!({
         "request_name": result.request_name,
         "request_file": result.request_file.display().to_string(),
@@ -78,7 +83,7 @@ fn print_run_json(result: &RunResult) {
             "duration_ms": r.duration_ms,
             "content_type": r.content_type,
             "content_length": r.content_length,
-            "headers": r.headers.iter().map(|(k, v)| serde_json::json!({
+            "headers": redaction::redact_headers(&r.headers).iter().map(|(k, v)| serde_json::json!({
                 "name": k,
                 "value": v,
             })).collect::<Vec<_>>(),
@@ -105,6 +110,11 @@ fn print_run_json(result: &RunResult) {
             .insert("assertions".into(), serde_json::Value::Array(assertions));
     }
 
+    json
+}
+
+fn print_run_json(result: &RunResult) {
+    let json = build_run_json(result);
     println!(
         "{}",
         serde_json::to_string_pretty(&json).unwrap_or_default()
@@ -313,7 +323,7 @@ mod tests {
     fn print_run_json_produces_valid_json() {
         let result = RunResult {
             request_name: "Test".into(),
-            request_file: PathBuf::from("test.hurl.yml"),
+            request_file: PathBuf::from("test.req.yml"),
             response: Some(ResponseArtifact {
                 status_code: 200,
                 http_version: "HTTP/1.1".into(),
@@ -339,6 +349,55 @@ mod tests {
     }
 
     #[test]
+    fn print_run_json_redacts_sensitive_headers() {
+        let result = RunResult {
+            request_name: "Test".into(),
+            request_file: PathBuf::from("test.req.yml"),
+            response: Some(ResponseArtifact {
+                status_code: 200,
+                http_version: "HTTP/1.1".into(),
+                headers: vec![
+                    ("authorization".into(), "Bearer secret-token".into()),
+                    ("set-cookie".into(), "session=abc123".into()),
+                    ("content-type".into(), "application/json".into()),
+                ],
+                content_type: Some("application/json".into()),
+                content_length: Some(2),
+                duration_ms: 10,
+                body_text: Some("{}".into()),
+                body_bytes: None,
+                is_binary: false,
+            }),
+            error: None,
+            exit_code: ExitCode::Success,
+            cancelled: false,
+            assertions: AssertionReport::default(),
+        };
+
+        let json = build_run_json(&result);
+        let headers = json["response"]["headers"].as_array().unwrap();
+
+        let auth = headers
+            .iter()
+            .find(|h| h["name"] == "authorization")
+            .unwrap();
+        assert_eq!(auth["value"], "<redacted>");
+
+        let cookie = headers.iter().find(|h| h["name"] == "set-cookie").unwrap();
+        assert_eq!(cookie["value"], "<redacted>");
+
+        let ct = headers
+            .iter()
+            .find(|h| h["name"] == "content-type")
+            .unwrap();
+        assert_eq!(ct["value"], "application/json");
+
+        let rendered = serde_json::to_string(&json).unwrap();
+        assert!(!rendered.contains("secret-token"));
+        assert!(!rendered.contains("abc123"));
+    }
+
+    #[test]
     fn collect_file_paths_flattens_tree() {
         let nodes = vec![CollectionNode {
             name: "requests".into(),
@@ -347,14 +406,14 @@ mod tests {
             children: vec![
                 CollectionNode {
                     name: "get_users".into(),
-                    path: PathBuf::from("requests/get_users.hurl.yml"),
+                    path: PathBuf::from("requests/get_users.req.yml"),
                     kind: CollectionNodeKind::RequestFile,
                     children: vec![],
                     depth: 1,
                 },
                 CollectionNode {
                     name: "create_user".into(),
-                    path: PathBuf::from("requests/create_user.hurl.yml"),
+                    path: PathBuf::from("requests/create_user.req.yml"),
                     kind: CollectionNodeKind::RequestFile,
                     children: vec![],
                     depth: 1,
@@ -373,14 +432,14 @@ mod tests {
     fn validation_report_empty_shows_ok() {
         let report = ValidationReport::default();
         // Just verify no panic
-        print_validation_human(&report, Path::new("test.hurl.yml"));
+        print_validation_human(&report, Path::new("test.req.yml"));
     }
 
     #[test]
     fn quiet_mode_suppresses_success() {
         let result = RunResult {
             request_name: "Test".into(),
-            request_file: PathBuf::from("test.hurl.yml"),
+            request_file: PathBuf::from("test.req.yml"),
             response: Some(ResponseArtifact {
                 status_code: 200,
                 http_version: "HTTP/1.1".into(),
@@ -407,7 +466,7 @@ mod tests {
     fn print_run_human_shows_assertion_output() {
         let result = RunResult {
             request_name: "Create User".into(),
-            request_file: PathBuf::from("create_user.hurl.yml"),
+            request_file: PathBuf::from("create_user.req.yml"),
             response: Some(ResponseArtifact {
                 status_code: 201,
                 http_version: "HTTP/1.1".into(),
@@ -459,7 +518,7 @@ mod tests {
     fn print_run_human_no_assertions_when_empty() {
         let result = RunResult {
             request_name: "Simple".into(),
-            request_file: PathBuf::from("simple.hurl.yml"),
+            request_file: PathBuf::from("simple.req.yml"),
             response: Some(ResponseArtifact {
                 status_code: 200,
                 http_version: "HTTP/1.1".into(),

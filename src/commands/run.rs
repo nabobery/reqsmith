@@ -9,6 +9,7 @@ use crate::core::repository;
 use crate::core::runner::{self, RunOptions};
 use crate::output;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     file: PathBuf,
     env: Option<String>,
@@ -16,6 +17,7 @@ pub async fn execute(
     output_mode: OutputMode,
     quiet: bool,
     save: bool,
+    deny_private_networks: bool,
 ) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
 
@@ -45,10 +47,17 @@ pub async fn execute(
         cli_vars: vars,
         validate_before_run: true,
         cwd,
+        deny_private_networks,
         #[cfg(feature = "plugins")]
         plugin_registry,
     };
-    let client = crate::infra::http_client::build_client();
+    let client = match crate::infra::http_client::build_client() {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("Failed to build HTTP client: {e}");
+            return ExitCode::from(models::ExitCode::InternalError as u8);
+        }
+    };
 
     // Set up cancellation via Ctrl+C.
     let cancel = CancellationToken::new();

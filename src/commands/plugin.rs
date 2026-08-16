@@ -91,7 +91,7 @@ fn render_plugin_list(
     output
 }
 
-/// Execute `hurl plugin list`.
+/// Execute `reqsmith plugin list`.
 pub fn execute_list() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
     let discovered = match discover_config(&cwd) {
@@ -99,7 +99,7 @@ pub fn execute_list() -> ExitCode {
         Ok(None) => {
             println!("No plugins found.");
             println!();
-            println!("To add plugins, create .hurl/plugins.toml in your project.");
+            println!("To add plugins, create .reqsmith/plugins.toml in your project.");
             return ExitCode::SUCCESS;
         }
         Err(e) => {
@@ -129,7 +129,7 @@ pub fn execute_list() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Execute `hurl plugin info <name>`.
+/// Execute `reqsmith plugin info <name>`.
 pub fn execute_info(name: String) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
     let discovered = match discover_config(&cwd) {
@@ -205,13 +205,14 @@ mod tests {
 
     fn discovered_config(root: &Path) -> DiscoveredConfig {
         DiscoveredConfig {
-            path: root.join(".hurl/plugins.toml"),
+            path: root.join(".reqsmith/plugins.toml"),
             config: PluginsConfig {
                 api_version: 1,
                 timeout_ms: 5000,
                 memory_limit_pages: 256,
                 plugin: vec![],
             },
+            source: crate::plugins::config::ConfigSource::ProjectLocal,
         }
     }
 
@@ -222,6 +223,8 @@ mod tests {
             enabled,
             capabilities: vec![PluginCapability::PreRequest],
             config: HashMap::new(),
+            sha256: None,
+            env_allowlist: vec![],
         }
     }
 
@@ -252,9 +255,9 @@ mod tests {
     #[test]
     fn plugin_status_reports_loaded_entries() {
         let tmp = tempfile::tempdir().unwrap();
-        let hurl_dir = tmp.path().join(".hurl/plugins");
-        std::fs::create_dir_all(&hurl_dir).unwrap();
-        std::fs::write(hurl_dir.join("loaded.wasm"), b"wasm").unwrap();
+        let reqsmith_dir = tmp.path().join(".reqsmith/plugins");
+        std::fs::create_dir_all(&reqsmith_dir).unwrap();
+        std::fs::write(reqsmith_dir.join("loaded.wasm"), b"wasm").unwrap();
         let discovered = discovered_config(tmp.path());
         let entry = plugin_entry("loaded", "plugins/loaded.wasm", true);
         let loaded_names = HashSet::from([String::from("loaded")]);
@@ -268,9 +271,9 @@ mod tests {
     #[test]
     fn plugin_status_reports_load_failure_for_present_but_unloaded_entry() {
         let tmp = tempfile::tempdir().unwrap();
-        let hurl_dir = tmp.path().join(".hurl/plugins");
-        std::fs::create_dir_all(&hurl_dir).unwrap();
-        std::fs::write(hurl_dir.join("broken.wasm"), b"wasm").unwrap();
+        let reqsmith_dir = tmp.path().join(".reqsmith/plugins");
+        std::fs::create_dir_all(&reqsmith_dir).unwrap();
+        std::fs::write(reqsmith_dir.join("broken.wasm"), b"wasm").unwrap();
         let discovered = discovered_config(tmp.path());
         let entry = plugin_entry("broken", "plugins/broken.wasm", true);
         let loaded_names = HashSet::new();
@@ -284,9 +287,9 @@ mod tests {
     #[test]
     fn render_plugin_list_includes_status_column() {
         let tmp = tempfile::tempdir().unwrap();
-        let hurl_dir = tmp.path().join(".hurl/plugins");
-        std::fs::create_dir_all(&hurl_dir).unwrap();
-        std::fs::write(hurl_dir.join("loaded.wasm"), b"wasm").unwrap();
+        let reqsmith_dir = tmp.path().join(".reqsmith/plugins");
+        std::fs::create_dir_all(&reqsmith_dir).unwrap();
+        std::fs::write(reqsmith_dir.join("loaded.wasm"), b"wasm").unwrap();
 
         let mut discovered = discovered_config(tmp.path());
         discovered.config.plugin = vec![

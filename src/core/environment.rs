@@ -10,20 +10,20 @@ use crate::infra::env_loader;
 #[derive(Error, Debug)]
 #[allow(dead_code)] // Used in Step 4+.
 pub enum EnvironmentError {
-    #[error("Named environment '{0}' not found in hurl_envs.yml")]
+    #[error("Named environment '{0}' not found in reqsmith_envs.yml")]
     NamedEnvNotFound(String),
 
-    #[error("Failed to read hurl_envs.yml: {0}")]
-    HurlEnvsReadError(String),
+    #[error("Failed to read reqsmith_envs.yml: {0}")]
+    ReqsmithEnvsReadError(String),
 
-    #[error("Failed to parse hurl_envs.yml: {0}")]
-    HurlEnvsParseError(String),
+    #[error("Failed to parse reqsmith_envs.yml: {0}")]
+    ReqsmithEnvsParseError(String),
 }
 
-/// Schema for `hurl_envs.yml`.
+/// Schema for `reqsmith_envs.yml`.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct HurlEnvsFile {
+struct ReqsmithEnvsFile {
     environments: BTreeMap<String, BTreeMap<String, String>>,
 }
 
@@ -31,7 +31,7 @@ struct HurlEnvsFile {
 ///
 /// Precedence (highest wins):
 /// 1. CLI `--var` overrides
-/// 2. Named environment from `hurl_envs.yml`
+/// 2. Named environment from `reqsmith_envs.yml`
 /// 3. `.env.<name>` file
 /// 4. `.env` file
 /// 5. OS environment (applied as fallback during interpolation, not here)
@@ -60,11 +60,11 @@ pub fn resolve_environment(
         }
     }
 
-    // Layer 2: hurl_envs.yml named environment
+    // Layer 2: reqsmith_envs.yml named environment
     if let Some(name) = env_name {
-        let yml_vars = load_hurl_envs_yml(cwd, name)?;
+        let yml_vars = load_reqsmith_envs_yml(cwd, name)?;
         for (k, v) in yml_vars {
-            sources.insert(k.clone(), VarSource::HurlEnvsYml(name.to_string()));
+            sources.insert(k.clone(), VarSource::ReqsmithEnvsYml(name.to_string()));
             values.insert(k, v);
         }
     }
@@ -85,33 +85,33 @@ pub fn resolve_environment(
 #[allow(dead_code)] // Used in Step 4+.
 pub fn apply_os_env_fallback(env: &mut EnvironmentSet, required_vars: &[String]) {
     for var_name in required_vars {
-        if !env.values.contains_key(var_name) {
-            if let Ok(val) = std::env::var(var_name) {
-                env.sources.insert(var_name.clone(), VarSource::OsEnv);
-                env.values.insert(var_name.clone(), val);
-            }
+        if !env.values.contains_key(var_name)
+            && let Ok(val) = std::env::var(var_name)
+        {
+            env.sources.insert(var_name.clone(), VarSource::OsEnv);
+            env.values.insert(var_name.clone(), val);
         }
     }
 }
 
-/// Load a named environment from `hurl_envs.yml`.
+/// Load a named environment from `reqsmith_envs.yml`.
 ///
-/// Returns an empty map if `hurl_envs.yml` does not exist.
+/// Returns an empty map if `reqsmith_envs.yml` does not exist.
 /// Returns an error if the file exists but the named environment is not found.
-fn load_hurl_envs_yml(
+fn load_reqsmith_envs_yml(
     cwd: &Path,
     env_name: &str,
 ) -> Result<BTreeMap<String, String>, EnvironmentError> {
-    let yml_path = cwd.join("hurl_envs.yml");
+    let yml_path = cwd.join("reqsmith_envs.yml");
     if !yml_path.exists() {
         return Ok(BTreeMap::new());
     }
 
     let content = std::fs::read_to_string(&yml_path)
-        .map_err(|e| EnvironmentError::HurlEnvsReadError(e.to_string()))?;
+        .map_err(|e| EnvironmentError::ReqsmithEnvsReadError(e.to_string()))?;
 
-    let file: HurlEnvsFile = serde_yaml::from_str(&content)
-        .map_err(|e| EnvironmentError::HurlEnvsParseError(e.to_string()))?;
+    let file: ReqsmithEnvsFile = serde_yaml::from_str(&content)
+        .map_err(|e| EnvironmentError::ReqsmithEnvsParseError(e.to_string()))?;
 
     file.environments
         .get(env_name)
@@ -156,11 +156,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_hurl_envs_yml_overrides_dotenv_named() {
+    fn resolve_reqsmith_envs_yml_overrides_dotenv_named() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join(".env.staging"), "TOKEN=from-dotenv\n").unwrap();
         fs::write(
-            tmp.path().join("hurl_envs.yml"),
+            tmp.path().join("reqsmith_envs.yml"),
             "environments:\n  staging:\n    TOKEN: from-yml\n",
         )
         .unwrap();
@@ -169,7 +169,7 @@ mod tests {
         assert_eq!(env.values.get("TOKEN").unwrap(), "from-yml");
         assert_eq!(
             env.sources.get("TOKEN").unwrap(),
-            &VarSource::HurlEnvsYml("staging".into())
+            &VarSource::ReqsmithEnvsYml("staging".into())
         );
     }
 
@@ -178,7 +178,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join(".env"), "TOKEN=from-env\n").unwrap();
         fs::write(
-            tmp.path().join("hurl_envs.yml"),
+            tmp.path().join("reqsmith_envs.yml"),
             "environments:\n  staging:\n    TOKEN: from-yml\n",
         )
         .unwrap();
@@ -190,9 +190,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_missing_hurl_envs_yml_is_ok() {
+    fn resolve_missing_reqsmith_envs_yml_is_ok() {
         let tmp = tempfile::tempdir().unwrap();
-        // No hurl_envs.yml, but requesting a named env — file doesn't exist, so no error
+        // No reqsmith_envs.yml, but requesting a named env — file doesn't exist, so no error
         let env = resolve_environment(tmp.path(), Some("staging"), &[]).unwrap();
         assert!(env.values.is_empty());
     }
@@ -201,7 +201,7 @@ mod tests {
     fn resolve_named_env_not_found_in_yml_is_error() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(
-            tmp.path().join("hurl_envs.yml"),
+            tmp.path().join("reqsmith_envs.yml"),
             "environments:\n  production:\n    TOKEN: prod-token\n",
         )
         .unwrap();
@@ -218,7 +218,7 @@ mod tests {
         fs::write(tmp.path().join(".env"), "A=1\n").unwrap();
         fs::write(tmp.path().join(".env.staging"), "B=2\n").unwrap();
         fs::write(
-            tmp.path().join("hurl_envs.yml"),
+            tmp.path().join("reqsmith_envs.yml"),
             "environments:\n  staging:\n    C: 3\n",
         )
         .unwrap();
@@ -235,7 +235,7 @@ mod tests {
         fs::write(tmp.path().join(".env"), "A=1\n").unwrap();
         fs::write(tmp.path().join(".env.staging"), "B=2\n").unwrap();
         fs::write(
-            tmp.path().join("hurl_envs.yml"),
+            tmp.path().join("reqsmith_envs.yml"),
             "environments:\n  staging:\n    C: '3'\n",
         )
         .unwrap();
@@ -254,14 +254,14 @@ mod tests {
         let mut env = resolve_environment(tmp.path(), None, &[]).unwrap();
 
         // SAFETY: Test-only, single-threaded test runner for this module.
-        unsafe { std::env::set_var("HURL_TEST_VAR_XYZ", "from-os") };
-        apply_os_env_fallback(&mut env, &["HURL_TEST_VAR_XYZ".into()]);
-        assert_eq!(env.values.get("HURL_TEST_VAR_XYZ").unwrap(), "from-os");
+        unsafe { std::env::set_var("REQSMITH_TEST_VAR_XYZ", "from-os") };
+        apply_os_env_fallback(&mut env, &["REQSMITH_TEST_VAR_XYZ".into()]);
+        assert_eq!(env.values.get("REQSMITH_TEST_VAR_XYZ").unwrap(), "from-os");
         assert_eq!(
-            env.sources.get("HURL_TEST_VAR_XYZ").unwrap(),
+            env.sources.get("REQSMITH_TEST_VAR_XYZ").unwrap(),
             &VarSource::OsEnv
         );
-        unsafe { std::env::remove_var("HURL_TEST_VAR_XYZ") };
+        unsafe { std::env::remove_var("REQSMITH_TEST_VAR_XYZ") };
     }
 
     #[test]

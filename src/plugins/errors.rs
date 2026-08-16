@@ -19,6 +19,13 @@ pub enum PluginError {
 
     #[error("Plugin '{name}' lacks required capability: {capability}")]
     MissingCapability { name: String, capability: String },
+
+    #[error("Plugin '{name}' failed integrity check: expected sha256 {expected}, got {actual}")]
+    IntegrityMismatch {
+        name: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 #[cfg(test)]
@@ -58,5 +65,14 @@ mod tests {
             capability: "pre_request".into(),
         };
         assert!(err.to_string().contains("pre_request"));
+
+        let err = PluginError::IntegrityMismatch {
+            name: "auth-plugin".into(),
+            expected: "aaaa".into(),
+            actual: "bbbb".into(),
+        };
+        assert!(err.to_string().contains("auth-plugin"));
+        assert!(err.to_string().contains("aaaa"));
+        assert!(err.to_string().contains("bbbb"));
     }
 }

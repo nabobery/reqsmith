@@ -11,7 +11,7 @@ pub fn execute(files: Vec<PathBuf>, check: bool) -> ExitCode {
         resolve_paths(files)
     };
     if paths.is_empty() {
-        eprintln!("No .hurl.yml files found");
+        eprintln!("No .req.yml files found");
         return ExitCode::from(1);
     }
 
@@ -54,7 +54,7 @@ pub fn execute(files: Vec<PathBuf>, check: bool) -> ExitCode {
     }
 }
 
-/// If a path is "." or a directory, discover all .hurl.yml files in it.
+/// If a path is "." or a directory, discover all .req.yml files in it.
 /// Otherwise, use the path as-is.
 fn resolve_paths(files: Vec<PathBuf>) -> Vec<PathBuf> {
     if files.is_empty() {

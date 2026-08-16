@@ -44,7 +44,7 @@ async fn main() -> ExitCode {
 async fn run_tui(tick_rate: Option<u64>, frame_rate: Option<u64>) -> ExitCode {
     let config = config::Config::new(tick_rate, frame_rate);
 
-    tracing::info!("Starting hurl TUI");
+    tracing::info!("Starting reqsmith TUI");
 
     let mut tui = match tui::Tui::new() {
         Ok(t) => t,
@@ -54,7 +54,13 @@ async fn run_tui(tick_rate: Option<u64>, frame_rate: Option<u64>) -> ExitCode {
         }
     };
 
-    let mut app = app::App::new(config);
+    let mut app = match app::App::new(config) {
+        Ok(app) => app,
+        Err(e) => {
+            eprintln!("Failed to initialize app: {e}");
+            return ExitCode::from(1);
+        }
+    };
 
     if let Err(e) = tui.enter() {
         eprintln!("Failed to enter TUI mode: {e}");
@@ -86,7 +92,11 @@ async fn run_command(cmd: cli::Command) -> ExitCode {
             output,
             quiet,
             save,
-        } => commands::run::execute(file, env, vars, output, quiet, save).await,
+            deny_private_networks,
+        } => {
+            commands::run::execute(file, env, vars, output, quiet, save, deny_private_networks)
+                .await
+        }
 
         cli::Command::Fmt { files, check } => commands::fmt::execute(files, check),
 

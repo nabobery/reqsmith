@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use crate::cli::OutputMode;
 use crate::core::environment;
-use crate::core::models::ExitCode as HurlExitCode;
+use crate::core::models::ExitCode as ReqsmithExitCode;
 use crate::core::repository;
 use crate::core::validation;
 use crate::output;
@@ -15,7 +15,7 @@ pub fn execute(files: Vec<PathBuf>, env: Option<String>, output_mode: OutputMode
         resolve_paths(files)
     };
     if paths.is_empty() {
-        eprintln!("No .hurl.yml files found");
+        eprintln!("No .req.yml files found");
         return ExitCode::from(1);
     }
 
@@ -50,9 +50,9 @@ pub fn execute(files: Vec<PathBuf>, env: Option<String>, output_mode: OutputMode
     }
 
     if any_internal_errors {
-        ExitCode::from(HurlExitCode::InternalError as u8)
+        ExitCode::from(ReqsmithExitCode::InternalError as u8)
     } else if any_errors {
-        ExitCode::from(HurlExitCode::ValidationFailure as u8)
+        ExitCode::from(ReqsmithExitCode::ValidationFailure as u8)
     } else {
         ExitCode::SUCCESS
     }

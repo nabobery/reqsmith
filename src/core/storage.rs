@@ -1,42 +1,114 @@
 use std::path::{Path, PathBuf};
 
-use color_eyre::eyre::{Context, Result};
+use color_eyre::eyre::{Context, Result, eyre};
 
+use super::atomic_write;
 use super::models::StoredRun;
+use super::redaction;
 
-/// Save a run snapshot to the `.hurl/runs/` directory.
+/// Save a run snapshot to the `.reqsmith/runs/` directory.
+///
+/// Response headers are redacted (see [`redaction::redact_headers`]) before
+/// the snapshot is serialized, so secrets returned by a server (e.g.
+/// `Set-Cookie`, a bearer token echoed back in a header) never land on disk.
+/// The write itself is atomic, symlink-refusing, and race-free against a
+/// concurrent save picking the same name — see [`atomic_write`] and
+/// [`write_unique_snapshot`].
 pub fn save_run(run: &StoredRun, dir: &Path) -> Result<PathBuf> {
-    let runs_dir = dir.join(".hurl").join("runs");
-    std::fs::create_dir_all(&runs_dir).wrap_err("Failed to create .hurl/runs directory")?;
+    let runs_dir = ensure_reqsmith_subdir(dir, "runs")?;
 
     let sanitized_name = run
         .request_name
         .replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "_");
-    let path = next_available_path(
+
+    let mut redacted = run.clone();
+    redacted.headers = redaction::redact_headers(&redacted.headers);
+    let json = serde_json::to_string_pretty(&redacted).wrap_err("Failed to serialize run")?;
+
+    write_unique_snapshot(
         &runs_dir,
         &format!("{}_{}", sanitized_name, run.timestamp),
         "json",
-    );
-
-    let json = serde_json::to_string_pretty(run).wrap_err("Failed to serialize run")?;
-    std::fs::write(&path, json).wrap_err("Failed to write run file")?;
-
-    Ok(path)
+        json.as_bytes(),
+    )
 }
 
-/// Save a binary response body to `.hurl/downloads/` with a collision-safe filename.
+/// Save a binary response body to `.reqsmith/downloads/` with a collision-safe filename.
 pub fn save_response_body(bytes: &[u8], dir: &Path) -> Result<PathBuf> {
-    let downloads_dir = dir.join(".hurl").join("downloads");
-    std::fs::create_dir_all(&downloads_dir)
-        .wrap_err("Failed to create .hurl/downloads directory")?;
+    let downloads_dir = ensure_reqsmith_subdir(dir, "downloads")?;
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let path = next_available_path(&downloads_dir, &format!("response_{timestamp}"), "bin");
-    std::fs::write(&path, bytes).wrap_err("Failed to write response body")?;
-    Ok(path)
+    write_unique_snapshot(
+        &downloads_dir,
+        &format!("response_{timestamp}"),
+        "bin",
+        bytes,
+    )
+}
+
+/// Create (if needed) `<base>/.reqsmith/<sub>` and refuse if either that directory
+/// or the intermediate `.reqsmith` directory is a symlink.
+///
+/// This is a cheap backstop against the obvious `.reqsmith -> /somewhere/hostile`
+/// (or `runs -> …`) swap that would otherwise let a write land outside the
+/// project tree. It is checked before creating anything, so we never
+/// `create_dir_all` *through* a symlinked `.reqsmith`. A fully attacker-controlled
+/// parent tree is out of scope (see the note in [`atomic_write`]).
+fn ensure_reqsmith_subdir(base: &Path, sub: &str) -> Result<PathBuf> {
+    let reqsmith_dir = base.join(".reqsmith");
+    if is_symlink(&reqsmith_dir) {
+        return Err(eyre!(
+            "Refusing to use symlinked .reqsmith directory at {}",
+            reqsmith_dir.display()
+        ));
+    }
+
+    let dir = reqsmith_dir.join(sub);
+    std::fs::create_dir_all(&dir)
+        .wrap_err_with(|| format!("Failed to create {} directory", dir.display()))?;
+    if is_symlink(&dir) {
+        return Err(eyre!(
+            "Refusing to use symlinked directory at {}",
+            dir.display()
+        ));
+    }
+    Ok(dir)
+}
+
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// Write `data` to a fresh `{stem}.{ext}` file (or `{stem}_{n}.{ext}` on
+/// collision) in `dir`, reserving each candidate atomically so two concurrent
+/// saves never clobber each other. A symlink at a candidate path is fatal
+/// (never followed), unlike a plain collision which advances to the next name.
+fn write_unique_snapshot(dir: &Path, stem: &str, extension: &str, data: &[u8]) -> Result<PathBuf> {
+    const MAX_CANDIDATES: usize = 10_000;
+    for suffix in 0..=MAX_CANDIDATES {
+        let candidate = if suffix == 0 {
+            dir.join(format!("{stem}.{extension}"))
+        } else {
+            dir.join(format!("{stem}_{suffix}.{extension}"))
+        };
+        match atomic_write::write_new(&candidate, data) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(eyre!("Failed to write {}: {e}", candidate.display()));
+            }
+        }
+    }
+    Err(eyre!(
+        "Exhausted {} filename candidates for '{stem}.{extension}' under {}",
+        MAX_CANDIDATES,
+        dir.display()
+    ))
 }
 
 /// Load a stored run from a JSON file.
@@ -50,7 +122,7 @@ pub fn load_run(path: &Path) -> Result<StoredRun> {
 
 /// List stored run files for a given request name.
 pub fn list_runs(dir: &Path, request_name: &str) -> Result<Vec<PathBuf>> {
-    let runs_dir = dir.join(".hurl").join("runs");
+    let runs_dir = dir.join(".reqsmith").join("runs");
     if !runs_dir.exists() {
         return Ok(Vec::new());
     }
@@ -59,7 +131,7 @@ pub fn list_runs(dir: &Path, request_name: &str) -> Result<Vec<PathBuf>> {
         request_name.replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "_");
 
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&runs_dir)
-        .wrap_err("Failed to read .hurl/runs directory")?
+        .wrap_err("Failed to read .reqsmith/runs directory")?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
         .filter(|p| {
@@ -74,22 +146,6 @@ pub fn list_runs(dir: &Path, request_name: &str) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn next_available_path(dir: &Path, stem: &str, extension: &str) -> PathBuf {
-    let mut path = dir.join(format!("{stem}.{extension}"));
-    if !path.exists() {
-        return path;
-    }
-
-    let mut suffix = 1usize;
-    loop {
-        path = dir.join(format!("{stem}_{suffix}.{extension}"));
-        if !path.exists() {
-            return path;
-        }
-        suffix += 1;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,7 +154,7 @@ mod tests {
     fn sample_run() -> StoredRun {
         StoredRun {
             request_name: "Get Users".into(),
-            request_file: PathBuf::from("requests/get_users.hurl.yml"),
+            request_file: PathBuf::from("requests/get_users.req.yml"),
             timestamp: "1711700000".into(),
             status_code: 200,
             duration_ms: 150,
@@ -181,5 +237,156 @@ mod tests {
         assert!(path.exists());
         assert_eq!(std::fs::read(&path).unwrap(), vec![0_u8, 1, 2, 3]);
         assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("bin"));
+    }
+
+    // --- B1: stored-run header redaction ---
+
+    #[test]
+    fn save_run_redacts_sensitive_headers_before_persisting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut run = sample_run();
+        run.headers = vec![
+            ("authorization".into(), "Bearer super-secret".into()),
+            ("content-type".into(), "application/json".into()),
+            ("set-cookie".into(), "session=abc123".into()),
+        ];
+
+        let path = save_run(&run, tmp.path()).unwrap();
+
+        // The raw bytes on disk must never contain the secret values.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("super-secret"));
+        assert!(!raw.contains("abc123"));
+        assert!(raw.contains("<redacted>"));
+
+        let loaded = load_run(&path).unwrap();
+        let auth = loaded
+            .headers
+            .iter()
+            .find(|(k, _)| k == "authorization")
+            .unwrap();
+        assert_eq!(auth.1, "<redacted>");
+        let cookie = loaded
+            .headers
+            .iter()
+            .find(|(k, _)| k == "set-cookie")
+            .unwrap();
+        assert_eq!(cookie.1, "<redacted>");
+        let ct = loaded
+            .headers
+            .iter()
+            .find(|(k, _)| k == "content-type")
+            .unwrap();
+        assert_eq!(ct.1, "application/json");
+    }
+
+    // --- B3: path traversal and symlink safety ---
+
+    #[test]
+    fn save_run_sanitizes_path_traversal_in_request_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut run = sample_run();
+        run.request_name = "../../etc/passwd".into();
+
+        let path = save_run(&run, tmp.path()).unwrap();
+        let runs_dir = tmp.path().join(".reqsmith").join("runs");
+
+        assert_eq!(path.parent().unwrap(), runs_dir.as_path());
+        assert!(path.exists());
+        assert!(!path.to_string_lossy().contains(".."));
+    }
+
+    #[test]
+    fn save_run_sanitizes_slashes_in_request_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut run = sample_run();
+        run.request_name = "nested/name/with/slashes".into();
+
+        let path = save_run(&run, tmp.path()).unwrap();
+        let runs_dir = tmp.path().join(".reqsmith").join("runs");
+
+        assert_eq!(path.parent().unwrap(), runs_dir.as_path());
+        assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_run_refuses_to_follow_a_preexisting_symlink_at_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = sample_run();
+        let runs_dir = tmp.path().join(".reqsmith").join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+
+        let sanitized_name = run
+            .request_name
+            .replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "_");
+        let target = runs_dir.join(format!("{}_{}.json", sanitized_name, run.timestamp));
+
+        // A dangling symlink: its target does not exist, so `Path::exists()`
+        // (used by `next_available_path` for collision detection) reports
+        // this path as "free" — exactly the gap `write_atomically` must close.
+        std::os::unix::fs::symlink(runs_dir.join("does-not-exist"), &target).unwrap();
+
+        let result = save_run(&run, tmp.path());
+        assert!(
+            result.is_err(),
+            "expected save_run to refuse a pre-existing symlink destination"
+        );
+
+        // The symlink itself must be left untouched, not followed/replaced.
+        let meta = std::fs::symlink_metadata(&target).unwrap();
+        assert!(meta.file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_run_refuses_symlinked_reqsmith_parent_directory() {
+        // A hostile `.reqsmith` pointing elsewhere must not let a snapshot write
+        // escape the project tree.
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), tmp.path().join(".reqsmith")).unwrap();
+
+        let result = save_run(&sample_run(), tmp.path());
+        assert!(
+            result.is_err(),
+            "save_run must refuse a symlinked .reqsmith directory"
+        );
+        // Nothing was written into the symlink target.
+        assert!(!elsewhere.path().join("runs").exists());
+    }
+
+    #[test]
+    fn concurrent_saves_never_clobber_each_other() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = Arc::new(tmp.path().to_path_buf());
+
+        // Every thread saves a run with the SAME request_name+timestamp, so
+        // they all contend for the identical primary filename. Race-free
+        // reservation must hand each a distinct path.
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let base = Arc::clone(&base);
+                thread::spawn(move || {
+                    let mut run = sample_run();
+                    run.body_text = Some(format!("{{\"n\":{i}}}"));
+                    save_run(&run, &base).unwrap()
+                })
+            })
+            .collect();
+
+        let paths: Vec<PathBuf> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(
+            unique.len(),
+            paths.len(),
+            "two saves collided onto one path"
+        );
+        // Every saved file still exists (none was overwritten out of existence).
+        assert!(paths.iter().all(|p| p.exists()));
     }
 }

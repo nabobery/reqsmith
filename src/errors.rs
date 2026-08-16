@@ -1,7 +1,7 @@
-/// Domain error types for hurl.
+/// Domain error types for reqsmith.
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
-pub enum HurlError {
+pub enum ReqsmithError {
     #[error("Terminal error: {0}")]
     Terminal(String),
 

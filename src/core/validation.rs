@@ -32,14 +32,14 @@ pub fn validate_document(doc: &RequestDocument, env: Option<&EnvironmentSet>) ->
         });
     }
 
-    if let Some(auth_plugin) = &doc.auth_plugin {
-        if auth_plugin.trim().is_empty() {
-            diagnostics.push(ValidationDiagnostic {
-                severity: ValidationSeverity::Error,
-                message: "auth_plugin must not be empty when present".into(),
-                field: Some("auth_plugin".into()),
-            });
-        }
+    if let Some(auth_plugin) = &doc.auth_plugin
+        && auth_plugin.trim().is_empty()
+    {
+        diagnostics.push(ValidationDiagnostic {
+            severity: ValidationSeverity::Error,
+            message: "auth_plugin must not be empty when present".into(),
+            field: Some("auth_plugin".into()),
+        });
     }
 
     // Header key checks.
@@ -188,10 +188,10 @@ fn interpolate_url_for_validation(
     let env = env?;
     let mut vars = env.values.clone();
     for variable in extract_variable_names(url_template) {
-        if let Ok(value) = std::env::var(&variable) {
-            if let std::collections::hash_map::Entry::Vacant(entry) = vars.entry(variable) {
-                entry.insert(value);
-            }
+        if let Ok(value) = std::env::var(&variable)
+            && let std::collections::hash_map::Entry::Vacant(entry) = vars.entry(variable)
+        {
+            entry.insert(value);
         }
     }
 

@@ -55,20 +55,20 @@ fn open_log_file_in_directory(log_dir: &PathBuf) -> io::Result<File> {
     OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_dir.join("hurl.log"))
+        .open(log_dir.join("reqsmith.log"))
 }
 
 fn log_directories() -> Vec<PathBuf> {
     let mut directories = Vec::new();
 
     if let Some(data_local_dir) = dirs::data_local_dir() {
-        directories.push(data_local_dir.join("hurl").join("logs"));
+        directories.push(data_local_dir.join("reqsmith").join("logs"));
     }
 
-    directories.push(std::env::temp_dir().join("hurl").join("logs"));
+    directories.push(std::env::temp_dir().join("reqsmith").join("logs"));
 
     if let Ok(current_dir) = std::env::current_dir() {
-        directories.push(current_dir.join(".hurl").join("logs"));
+        directories.push(current_dir.join(".reqsmith").join("logs"));
     }
 
     directories
@@ -79,7 +79,10 @@ mod tests {
     use super::*;
 
     fn unique_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("hurl-logging-test-{name}-{}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "reqsmith-logging-test-{name}-{}",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -93,7 +96,7 @@ mod tests {
         fs::write(&blocked, b"not a directory").unwrap();
 
         let file = open_log_file_in_candidates([blocked.clone(), fallback.clone()]).unwrap();
-        let expected_path = fallback.join("hurl.log");
+        let expected_path = fallback.join("reqsmith.log");
 
         assert!(expected_path.exists());
         drop(file);

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::Value as JsonValue;
 
-/// HTTP methods supported by hurl.
+/// HTTP methods supported by reqsmith.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 #[allow(dead_code)] // Variants used progressively across Phase 1 steps.
@@ -61,7 +61,7 @@ fn default_enabled() -> bool {
     true
 }
 
-/// A saved HTTP request document, serializable to/from `.hurl.yml`.
+/// A saved HTTP request document, serializable to/from `.req.yml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestDocument {
     pub name: String,
@@ -142,7 +142,7 @@ pub enum VarSource {
     OsEnv,
     DotEnv,
     DotEnvNamed(String),
-    HurlEnvsYml(String),
+    ReqsmithEnvsYml(String),
     CliOverride,
     #[cfg(feature = "plugins")]
     Plugin,
@@ -154,7 +154,7 @@ impl fmt::Display for VarSource {
             VarSource::OsEnv => write!(f, "OS environment"),
             VarSource::DotEnv => write!(f, ".env"),
             VarSource::DotEnvNamed(name) => write!(f, ".env.{name}"),
-            VarSource::HurlEnvsYml(name) => write!(f, "hurl_envs.yml [{name}]"),
+            VarSource::ReqsmithEnvsYml(name) => write!(f, "reqsmith_envs.yml [{name}]"),
             VarSource::CliOverride => write!(f, "--var"),
             #[cfg(feature = "plugins")]
             VarSource::Plugin => write!(f, "plugin"),
@@ -620,7 +620,7 @@ mod tests {
             body: Some("{ \"name\": \"test\" }".into()),
             auth_plugin: None,
             assertions: vec![],
-            file_path: Some("/tmp/test.hurl.yml".into()),
+            file_path: Some("/tmp/test.req.yml".into()),
         };
 
         let yaml = serde_yaml::to_string(&doc).unwrap();
@@ -773,8 +773,8 @@ assertions:
             ".env.staging"
         );
         assert_eq!(
-            VarSource::HurlEnvsYml("prod".into()).to_string(),
-            "hurl_envs.yml [prod]"
+            VarSource::ReqsmithEnvsYml("prod".into()).to_string(),
+            "reqsmith_envs.yml [prod]"
         );
         assert_eq!(VarSource::CliOverride.to_string(), "--var");
     }

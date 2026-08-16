@@ -1,0 +1,54 @@
+name: Request format question / proposal
+description: Ask a question about, or propose a change to, the .req.yml request file format
+title: "[Request format]: "
+labels: ["request-format", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for questions or proposals about the `.req.yml`
+        request file format (schema, interpolation, assertions, etc.).
+
+  - type: dropdown
+    id: type
+    attributes:
+      label: Type
+      options:
+        - Question about existing behavior
+        - Proposal for a new field/feature
+        - Ambiguity or inconsistency in the format
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Describe your question or proposal in detail.
+    validations:
+      required: true
+
+  - type: textarea
+    id: example
+    attributes:
+      label: Example request file
+      description: A minimal `.req.yml` snippet illustrating the question or proposal. Use synthetic URLs, headers, and values only.
+      render: yaml
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Related issues, discussions, or use cases.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: secrets
+    attributes:
+      label: Secrets check
+      options:
+        - label: I have removed all real secrets/tokens from logs and examples
+          required: true

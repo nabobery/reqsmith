@@ -164,16 +164,15 @@ impl Component for CollectionsPane {
         };
 
         if self.nodes.is_empty() {
-            let paragraph = ratatui::widgets::Paragraph::new(
-                "No .hurl.yml files found.\nPress 'r' to refresh.",
-            )
-            .block(
-                Block::default()
-                    .title(" Collections ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(border_color)),
-            )
-            .style(Style::default().fg(Color::DarkGray));
+            let paragraph =
+                ratatui::widgets::Paragraph::new("No .req.yml files found.\nPress 'r' to refresh.")
+                    .block(
+                        Block::default()
+                            .title(" Collections ")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(border_color)),
+                    )
+                    .style(Style::default().fg(Color::DarkGray));
             frame.render_widget(paragraph, area);
             return;
         }
@@ -251,14 +250,14 @@ mod tests {
                 children: vec![
                     CollectionNode {
                         name: "get_users".into(),
-                        path: "/api/get_users.hurl.yml".into(),
+                        path: "/api/get_users.req.yml".into(),
                         kind: CollectionNodeKind::RequestFile,
                         depth: 1,
                         children: vec![],
                     },
                     CollectionNode {
                         name: "create_user".into(),
-                        path: "/api/create_user.hurl.yml".into(),
+                        path: "/api/create_user.req.yml".into(),
                         kind: CollectionNodeKind::RequestFile,
                         depth: 1,
                         children: vec![],
@@ -267,7 +266,7 @@ mod tests {
             },
             CollectionNode {
                 name: "health".into(),
-                path: "/health.hurl.yml".into(),
+                path: "/health.req.yml".into(),
                 kind: CollectionNodeKind::RequestFile,
                 depth: 0,
                 children: vec![],

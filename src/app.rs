@@ -51,11 +51,18 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: Config) -> Self {
+    /// Build the application state.
+    ///
+    /// Fallible on purpose: if the hardened HTTP client (connect timeout,
+    /// bounded redirects, cross-origin header stripping) can't be constructed,
+    /// we surface that at startup rather than silently degrading to a default
+    /// `reqwest::Client` whose security-relevant settings were never reviewed.
+    pub fn new(config: Config) -> Result<Self> {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
 
         let cwd = std::env::current_dir().unwrap_or_default();
-        let http_client = http_client::build_client();
+        let http_client = http_client::build_client()
+            .map_err(|e| color_eyre::eyre::eyre!("Failed to build HTTP client: {e}"))?;
 
         #[cfg(feature = "plugins")]
         let plugin_registry =
@@ -71,7 +78,7 @@ impl App {
                 }
             };
 
-        Self {
+        Ok(Self {
             config,
             focus: FocusTarget::Collections,
             should_quit: false,
@@ -89,7 +96,7 @@ impl App {
             status_message_ticks: 0,
             #[cfg(feature = "plugins")]
             plugin_registry,
-        }
+        })
     }
 
     pub async fn run(&mut self, tui: &mut Tui) -> Result<()> {
@@ -305,6 +312,10 @@ impl App {
                         cli_vars: vec![],
                         validate_before_run: false,
                         cwd: self.cwd.clone(),
+                        // The interactive TUI is a local-first client; keep
+                        // localhost/LAN targets working (the CLI `run
+                        // --deny-private-networks` flag is the opt-in path).
+                        deny_private_networks: false,
                         #[cfg(feature = "plugins")]
                         plugin_registry: self.plugin_registry.clone(),
                     };
@@ -486,7 +497,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     fn make_app() -> App {
-        App::new(Config::default())
+        App::new(Config::default()).expect("building the app with a default client should succeed")
     }
 
     fn key(code: KeyCode) -> KeyEvent {

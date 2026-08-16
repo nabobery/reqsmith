@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # The full gate lives in the reusable `checks.yml` workflow so that CI (here)
+  # and the release pipeline run the identical set of checks. Status checks
+  # surface as `checks / fmt`, `checks / clippy`, `checks / test (…)`, etc.
+  checks:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/checks.yml

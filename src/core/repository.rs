@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use color_eyre::eyre::{Result, WrapErr};
 use walkdir::WalkDir;
 
+use super::atomic_write;
 use super::models::{CollectionNode, CollectionNodeKind, RequestDocument};
 
 #[allow(dead_code)] // Used in Step 6 when collections pane is wired up.
@@ -12,7 +13,7 @@ const IGNORED_DIRS: &[&str] = &[
     ".git",
     "target",
     "node_modules",
-    ".hurl",
+    ".reqsmith",
     "dist",
     "build",
     ".next",
@@ -21,7 +22,7 @@ const IGNORED_DIRS: &[&str] = &[
 ];
 
 #[allow(dead_code)] // Used in Step 6.
-/// Recursively discover `.hurl.yml` files from `cwd`, returning a tree of
+/// Recursively discover `.req.yml` files from `cwd`, returning a tree of
 /// collection nodes grouped by directory.
 pub fn discover_requests(cwd: &Path) -> Result<Vec<CollectionNode>> {
     let mut file_paths: Vec<PathBuf> = WalkDir::new(cwd)
@@ -40,7 +41,7 @@ pub fn discover_requests(cwd: &Path) -> Result<Vec<CollectionNode>> {
                 && e.path()
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.ends_with(".hurl.yml") || n.ends_with(".hurl.yaml"))
+                    .is_some_and(|n| n.ends_with(".req.yml") || n.ends_with(".req.yaml"))
         })
         .map(|e| e.into_path())
         .collect();
@@ -61,17 +62,15 @@ pub fn load_request(path: &Path) -> Result<RequestDocument> {
 }
 
 #[allow(dead_code)] // Used in Step 5.
-/// Save a request document to a YAML file using atomic write.
+/// Save a request document to a YAML file using an atomic, symlink-refusing
+/// write (shared with the rest of reqsmith's on-disk writes; see
+/// [`atomic_write`]).
 pub fn save_request(doc: &RequestDocument, path: &Path) -> Result<()> {
     let yaml =
         serde_yaml::to_string(doc).wrap_err("Failed to serialize request document to YAML")?;
 
-    // Atomic write: write to temp file, then rename.
-    let tmp_path = path.with_extension("hurl.yml.tmp");
-    fs::write(&tmp_path, &yaml)
-        .wrap_err_with(|| format!("Failed to write temp file {}", tmp_path.display()))?;
-    fs::rename(&tmp_path, path)
-        .wrap_err_with(|| format!("Failed to rename temp file to {}", path.display()))?;
+    atomic_write::write_replace(path, yaml.as_bytes())
+        .wrap_err_with(|| format!("Failed to write request file {}", path.display()))?;
 
     Ok(())
 }
@@ -111,8 +110,8 @@ fn insert_into_tree(
     if is_leaf {
         // This is a request file.
         let display_name = name
-            .strip_suffix(".hurl.yml")
-            .or_else(|| name.strip_suffix(".hurl.yaml"))
+            .strip_suffix(".req.yml")
+            .or_else(|| name.strip_suffix(".req.yaml"))
             .unwrap_or(name);
         nodes.push(CollectionNode {
             name: display_name.to_string(),
@@ -166,11 +165,11 @@ mod tests {
 
     fn write_request_file(dir: &Path, name: &str) {
         let yaml = format!("name: {name}\nmethod: GET\nurl: https://example.com\n");
-        fs::write(dir.join(format!("{name}.hurl.yml")), yaml).unwrap();
+        fs::write(dir.join(format!("{name}.req.yml")), yaml).unwrap();
     }
 
     #[test]
-    fn discover_finds_hurl_yml_files() {
+    fn discover_finds_req_yml_files() {
         let tmp = create_temp_dir();
         write_request_file(tmp.path(), "get_users");
         write_request_file(tmp.path(), "create_user");
@@ -227,7 +226,7 @@ mod tests {
     #[test]
     fn load_request_parses_valid_yaml() {
         let tmp = create_temp_dir();
-        let path = tmp.path().join("test.hurl.yml");
+        let path = tmp.path().join("test.req.yml");
         let yaml = "name: Test\nmethod: POST\nurl: https://example.com\n";
         fs::write(&path, yaml).unwrap();
 
@@ -240,7 +239,7 @@ mod tests {
     #[test]
     fn load_request_fails_on_invalid_yaml() {
         let tmp = create_temp_dir();
-        let path = tmp.path().join("bad.hurl.yml");
+        let path = tmp.path().join("bad.req.yml");
         fs::write(&path, "not: [valid: yaml: {{{").unwrap();
 
         let result = load_request(&path);
@@ -250,7 +249,7 @@ mod tests {
     #[test]
     fn save_and_load_round_trip() {
         let tmp = create_temp_dir();
-        let path = tmp.path().join("roundtrip.hurl.yml");
+        let path = tmp.path().join("roundtrip.req.yml");
 
         let doc = RequestDocument {
             name: "Round Trip".into(),

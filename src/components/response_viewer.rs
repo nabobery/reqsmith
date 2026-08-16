@@ -11,6 +11,7 @@ use crate::action::Action;
 use crate::components::json_tree::JsonTreeState;
 use crate::core::diffing;
 use crate::core::models::{AssertionReport, DiffArtifact, DiffLine, ResponseArtifact};
+use crate::core::redaction;
 
 use super::{Component, EventResult};
 
@@ -170,35 +171,36 @@ impl ResponseViewerPane {
 impl Component for ResponseViewerPane {
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         // When in tree mode on the Body tab, route navigation keys to the tree state.
-        if self.json_tree_mode && self.active_tab == ResponseTab::Body {
-            if let Some(ref mut tree) = self.json_tree {
-                match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        tree.move_down();
-                        return EventResult::Consumed;
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        tree.move_up();
-                        return EventResult::Consumed;
-                    }
-                    KeyCode::Char('h') | KeyCode::Left => {
-                        tree.collapse_selected();
-                        return EventResult::Consumed;
-                    }
-                    KeyCode::Char('l') | KeyCode::Right => {
-                        tree.expand_selected();
-                        return EventResult::Consumed;
-                    }
-                    KeyCode::Enter => {
-                        tree.toggle_selected();
-                        return EventResult::Consumed;
-                    }
-                    KeyCode::Char('t') => {
-                        self.json_tree_mode = false;
-                        return EventResult::Consumed;
-                    }
-                    _ => {} // Fall through to default handling below
+        if self.json_tree_mode
+            && self.active_tab == ResponseTab::Body
+            && let Some(ref mut tree) = self.json_tree
+        {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    tree.move_down();
+                    return EventResult::Consumed;
                 }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    tree.move_up();
+                    return EventResult::Consumed;
+                }
+                KeyCode::Char('h') | KeyCode::Left => {
+                    tree.collapse_selected();
+                    return EventResult::Consumed;
+                }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    tree.expand_selected();
+                    return EventResult::Consumed;
+                }
+                KeyCode::Enter => {
+                    tree.toggle_selected();
+                    return EventResult::Consumed;
+                }
+                KeyCode::Char('t') => {
+                    self.json_tree_mode = false;
+                    return EventResult::Consumed;
+                }
+                _ => {} // Fall through to default handling below
             }
         }
 
@@ -406,13 +408,14 @@ impl Component for ResponseViewerPane {
                         }
                     }
                     ResponseTab::Headers => {
+                        // Redact sensitive values (e.g. Set-Cookie) before display.
+                        let headers = redaction::redact_headers(&response.headers);
                         let visible_rows = chunks[2].height.saturating_sub(1).max(1) as usize;
-                        let max_offset = response.headers.len().saturating_sub(visible_rows);
+                        let max_offset = headers.len().saturating_sub(visible_rows);
                         let start = usize::min(self.scroll_offset as usize, max_offset);
-                        let end = usize::min(start + visible_rows, response.headers.len());
+                        let end = usize::min(start + visible_rows, headers.len());
 
-                        let rows: Vec<Row> = response
-                            .headers
+                        let rows: Vec<Row> = headers
                             .iter()
                             .skip(start)
                             .take(end.saturating_sub(start))
@@ -771,6 +774,94 @@ mod tests {
 
         assert!(!rendered.contains("first-header"));
         assert!(rendered.contains("second-header"));
+    }
+
+    #[test]
+    fn headers_tab_redacts_sensitive_values() {
+        let mut viewer = ResponseViewerPane::default();
+        viewer.set_response(
+            ResponseArtifact {
+                status_code: 200,
+                http_version: "HTTP/1.1".into(),
+                headers: vec![
+                    ("authorization".into(), "Bearer super-secret-token".into()),
+                    ("content-type".into(), "application/json".into()),
+                ],
+                content_type: Some("application/json".into()),
+                content_length: Some(2),
+                duration_ms: 10,
+                body_text: Some("{}".into()),
+                body_bytes: None,
+                is_binary: false,
+            },
+            AssertionReport::default(),
+        );
+        viewer.active_tab = ResponseTab::Headers;
+
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| viewer.render(frame, frame.area(), true))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(!rendered.contains("super-secret-token"));
+        assert!(rendered.contains("redacted"));
+        assert!(rendered.contains("content-type"));
+    }
+
+    #[test]
+    fn diff_tab_redacts_sensitive_header_values() {
+        let mut viewer = ResponseViewerPane::default();
+        let previous = ResponseArtifact {
+            status_code: 200,
+            http_version: "HTTP/1.1".into(),
+            headers: vec![("set-cookie".into(), "session=old-secret".into())],
+            content_type: None,
+            content_length: None,
+            duration_ms: 10,
+            body_text: Some("old".into()),
+            body_bytes: None,
+            is_binary: false,
+        };
+        let current = ResponseArtifact {
+            status_code: 200,
+            http_version: "HTTP/1.1".into(),
+            headers: vec![("set-cookie".into(), "session=new-secret".into())],
+            content_type: None,
+            content_length: None,
+            duration_ms: 10,
+            body_text: Some("new".into()),
+            body_bytes: None,
+            is_binary: false,
+        };
+        viewer.set_response_with_diff(current, AssertionReport::default(), Some(&previous));
+        viewer.active_tab = ResponseTab::Diff;
+
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| viewer.render(frame, frame.area(), true))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(!rendered.contains("old-secret"));
+        assert!(!rendered.contains("new-secret"));
+        assert!(rendered.contains("redacted"));
     }
 
     #[test]
