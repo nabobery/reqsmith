@@ -125,12 +125,27 @@ jobs:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
         with:
           fetch-depth: 0
-      # gitleaks is version-pinned (reproducible scan) and installed via the
-      # already-pinned taiki-e/install-action, so no extra action to audit and
-      # no GITLEAKS_LICENSE needed for this public repo.
-      - uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2
-        with:
-          tool: gitleaks@8.30.1
+      # Install gitleaks straight from its GitHub release, pinned by version and
+      # verified by SHA-256. We deliberately do NOT use taiki-e/install-action
+      # here: its bundled tool manifest doesn't track this gitleaks version and
+      # silently falls back to cargo-binstall, which then fails trying to find a
+      # (nonexistent) `gitleaks` crate. A pinned download + checksum check is
+      # deterministic and equally supply-chain-sound. No GITLEAKS_LICENSE is
+      # needed for this public repo. Bump both `version` and `sha256` together
+      # (the sha256 is from the release's gitleaks_<ver>_checksums.txt).
+      - name: Install gitleaks (pinned + checksum-verified)
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="8.30.1"
+          sha256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz"
+          curl --fail --show-error --location --retry 3 --output gitleaks.tar.gz "$url"
+          echo "${sha256}  gitleaks.tar.gz" | sha256sum --check
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          rm -f gitleaks.tar.gz gitleaks
+          gitleaks version
       - name: gitleaks (commit history)
         run: gitleaks git --redact --no-banner .
       - name: gitleaks (working tree)
