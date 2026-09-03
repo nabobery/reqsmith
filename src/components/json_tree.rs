@@ -116,7 +116,7 @@ impl JsonTreeState {
     }
 
     /// Return the currently visible nodes.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn visible_nodes(&self) -> &[JsonTreeNode] {
         &self.nodes
     }

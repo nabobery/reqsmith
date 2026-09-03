@@ -228,7 +228,7 @@ impl RequestEditorPane {
         self.dirty = false;
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn has_document(&self) -> bool {
         self.document.is_some()
     }

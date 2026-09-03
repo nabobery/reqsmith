@@ -31,13 +31,13 @@ pub fn diff_responses(
     }
 }
 
-/// Diff two header sets. Change detection (`Changed`/`Added`/`Removed` vs. no
-/// diff) is computed against the REAL values, so a rotated secret is still
-/// reported as changed. The values actually stored in the returned
-/// `HeaderDiff`s are redacted for sensitive header names via
-/// [`redaction::redact_headers`] — so a secret rotation surfaces as
-/// `<redacted> -> <redacted>` rather than either leaking the old/new value or
-/// silently disappearing from the diff.
+/// Diff two header sets. The values stored in the returned `HeaderDiff`s are
+/// redacted for sensitive header names, as `<redacted:sha256:XXXXXXXX>` — a
+/// truncated fingerprint of the real value, not a flat marker. That keeps a
+/// rotation visible from both directions: diffing two live responses compares
+/// the real values, and diffing two stored snapshots (which only ever hold the
+/// placeholder) still sees two different placeholders, so the rotation is
+/// reported as changed instead of vanishing.
 fn diff_headers(baseline: &[(String, String)], candidate: &[(String, String)]) -> Vec<HeaderDiff> {
     // Resolve the redaction policy once for the whole header set rather than
     // re-reading `REQSMITH_REDACT_HEADERS` for every header comparison.
@@ -49,14 +49,14 @@ fn diff_headers(baseline: &[(String, String)], candidate: &[(String, String)]) -
             Some((_, new_val)) if new_val != old_val => {
                 diffs.push(HeaderDiff::Changed {
                     key: key.clone(),
-                    old: policy.redact_value_for(key, old_val),
-                    new: policy.redact_value_for(key, new_val),
+                    old: policy.redact_value_for(key, old_val).into_owned(),
+                    new: policy.redact_value_for(key, new_val).into_owned(),
                 });
             }
             None => {
                 diffs.push(HeaderDiff::Removed(
                     key.clone(),
-                    policy.redact_value_for(key, old_val),
+                    policy.redact_value_for(key, old_val).into_owned(),
                 ));
             }
             _ => {}
@@ -67,7 +67,7 @@ fn diff_headers(baseline: &[(String, String)], candidate: &[(String, String)]) -
         if !baseline.iter().any(|(k, _)| k == key) {
             diffs.push(HeaderDiff::Added(
                 key.clone(),
-                policy.redact_value_for(key, val),
+                policy.redact_value_for(key, val).into_owned(),
             ));
         }
     }
@@ -140,6 +140,7 @@ mod tests {
             body_text: body.map(String::from),
             body_bytes: None,
             is_binary: false,
+            truncated: false,
         }
     }
 
@@ -249,18 +250,23 @@ mod tests {
         assert_eq!(sorted, serde_json::json!([3, 1, 2]));
     }
 
-    // --- B1: header diff redaction ---
+    // --- header diff redaction ---
 
     #[test]
     fn header_diff_redacts_changed_sensitive_value() {
         let a = artifact(200, vec![("authorization", "Bearer old-token")], None);
         let b = artifact(200, vec![("authorization", "Bearer new-token")], None);
         let diff = diff_responses(&a, &b, "a", "b");
-        assert!(matches!(
-            &diff.header_diffs[0],
-            HeaderDiff::Changed { key, old, new }
-                if key == "authorization" && old == "<redacted>" && new == "<redacted>"
-        ));
+        let HeaderDiff::Changed { key, old, new } = &diff.header_diffs[0] else {
+            panic!("expected a changed header, got {:?}", diff.header_diffs[0]);
+        };
+        assert_eq!(key, "authorization");
+        for value in [old, new] {
+            assert!(value.starts_with(redaction::REDACTED_PREFIX));
+            assert!(!value.contains("old-token"));
+            assert!(!value.contains("new-token"));
+        }
+        assert_ne!(old, new, "a rotated token must not collapse to one value");
     }
 
     #[test]
@@ -274,25 +280,24 @@ mod tests {
     #[test]
     fn header_diff_redacts_removed_and_added_sensitive_values() {
         let a = artifact(200, vec![("set-cookie", "session=abc")], None);
-        let b = artifact(200, vec![("set-cookie", "session=xyz")], None);
-        let diff = diff_responses(&a, &b, "a", "b");
-        assert!(matches!(
-            &diff.header_diffs[0],
-            HeaderDiff::Changed { key, old, new }
-                if key == "set-cookie" && old == "<redacted>" && new == "<redacted>"
-        ));
-
         let c = artifact(200, vec![], None);
+
         let removed_diff = diff_responses(&a, &c, "a", "c");
         assert!(matches!(
             &removed_diff.header_diffs[0],
-            HeaderDiff::Removed(k, v) if k == "set-cookie" && v == "<redacted>"
+            HeaderDiff::Removed(k, v)
+                if k == "set-cookie"
+                    && v.starts_with(redaction::REDACTED_PREFIX)
+                    && !v.contains("abc")
         ));
 
         let added_diff = diff_responses(&c, &a, "c", "a");
         assert!(matches!(
             &added_diff.header_diffs[0],
-            HeaderDiff::Added(k, v) if k == "set-cookie" && v == "<redacted>"
+            HeaderDiff::Added(k, v)
+                if k == "set-cookie"
+                    && v.starts_with(redaction::REDACTED_PREFIX)
+                    && !v.contains("abc")
         ));
     }
 

@@ -1,14 +1,30 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
-use std::time::Instant;
+use std::net::{IpAddr, Ipv4Addr};
+use std::time::{Duration, Instant};
+
+use reqwest::header::{
+    AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderValue, LOCATION,
+    PROXY_AUTHORIZATION, REFERER, TRANSFER_ENCODING, WWW_AUTHENTICATE,
+};
+use reqwest::{Method, StatusCode};
+use tokio::time::Instant as TokioInstant;
 
 use tokio_util::sync::CancellationToken;
 
 use super::interpolation::interpolate_document;
 use super::models::{HttpMethod, RequestDocument, ResponseArtifact};
+use crate::infra::http_client::{CONNECT_TIMEOUT_SECS, MAX_REDIRECTS, TOTAL_TIMEOUT_SECS};
 
 /// Maximum response body size to read into memory (10 MB).
-const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+
+/// Human-readable form of [`MAX_BODY_SIZE`] for user-facing truncation notices.
+pub(crate) fn max_body_size_label() -> String {
+    format!("{} MB", MAX_BODY_SIZE / (1024 * 1024))
+}
+
+/// Upper bound on the body buffer reserved up front from `Content-Length`.
+const INITIAL_BODY_CAPACITY: usize = 64 * 1024;
 
 /// Policy knobs for [`execute_request_with_options`].
 ///
@@ -16,11 +32,15 @@ const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 /// are allowed. reqsmith is a local, user-driven tool — sending requests to
 /// `localhost`, `127.0.0.1`, or a machine on the private LAN is a primary,
 /// legitimate use case, so that must keep working out of the box.
+///
+/// The `client` passed to [`execute_request_with_options`] must be built with
+/// `infra::http_client::build_client(deny_private_networks)` using this same
+/// flag so proxy handling and the per-hop policy stay aligned.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExecutionOptions {
-    /// When `true`, reject requests whose host is a loopback, RFC1918
-    /// private, link-local, or IPv6 unique-local address, or that resolves
-    /// (via DNS) only to such addresses. Opt-in; default is `false`.
+    /// When `true`, reject requests whose host is — or resolves to — anything
+    /// other than a public unicast address (see [`is_private_or_local`]).
+    /// Opt-in; default is `false`.
     pub deny_private_networks: bool,
 }
 
@@ -32,7 +52,6 @@ fn is_likely_binary(bytes: &[u8]) -> bool {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)]
 pub enum ExecutionError {
     #[error("Request cancelled")]
     Cancelled,
@@ -44,22 +63,53 @@ pub enum ExecutionError {
     InvalidRequest(String),
 }
 
-/// Execute an HTTP request built from a `RequestDocument` with environment
-/// variable interpolation. Supports cancellation via `CancellationToken`.
-///
-/// Uses default [`ExecutionOptions`] (private/loopback addresses allowed).
-/// Use [`execute_request_with_options`] to opt in to private-network denial.
-#[allow(dead_code)] // Used in Step 5.
-pub async fn execute_request(
-    client: &reqwest::Client,
-    doc: &RequestDocument,
-    vars: &HashMap<String, String>,
-    cancel: CancellationToken,
-) -> Result<ResponseArtifact, ExecutionError> {
-    execute_request_with_options(client, doc, vars, cancel, ExecutionOptions::default()).await
+/// Flatten a reqwest error's source chain into one message. reqwest's own
+/// `Display` is only the outer layer (e.g. plain "builder error") — the
+/// useful detail ("connection refused", an invalid header value) lives in
+/// the source chain.
+fn flatten(e: &reqwest::Error) -> String {
+    let mut message = e.to_string();
+    let mut source = std::error::Error::source(e);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
-/// Same as [`execute_request`], with explicit network policy options.
+/// Which timeout budget a timed-out request exceeded. reqwest's connect
+/// timeout also makes `is_timeout()` true, so it must be checked first or
+/// every connect timeout gets mislabeled with the (much longer) total budget.
+fn timeout_label(is_connect: bool) -> String {
+    if is_connect {
+        format!("exceeded the {CONNECT_TIMEOUT_SECS}s connect timeout")
+    } else {
+        format!("exceeded the {TOTAL_TIMEOUT_SECS}s total timeout")
+    }
+}
+
+/// Turn a reqwest failure into a message that never carries the request URL.
+///
+/// `Error::without_url` drops the URL (which can hold query-string
+/// credentials).
+fn network_error(e: reqwest::Error) -> ExecutionError {
+    let timed_out = e.is_timeout();
+    let is_connect = e.is_connect();
+    let e = e.without_url();
+
+    let message = flatten(&e);
+    let message = if timed_out {
+        format!("request {}: {message}", timeout_label(is_connect))
+    } else {
+        message
+    };
+    ExecutionError::Network(message)
+}
+
+/// Execute an HTTP request built from a `RequestDocument` with environment
+/// variable interpolation, under the given network policy options. Supports
+/// cancellation via `CancellationToken`.
 pub async fn execute_request_with_options(
     client: &reqwest::Client,
     doc: &RequestDocument,
@@ -67,61 +117,20 @@ pub async fn execute_request_with_options(
     cancel: CancellationToken,
     options: ExecutionOptions,
 ) -> Result<ResponseArtifact, ExecutionError> {
-    // 1. Interpolate variables.
     let resolved = interpolate_document(doc, vars).map_err(ExecutionError::Interpolation)?;
 
-    // 1.5. Parse and validate the URL: scheme allowlist (always enforced) and
+    // Parse and validate the URL: scheme allowlist (always enforced) and
     // optional private-network denial (opt-in via `options`).
-    let parsed_url = reqwest::Url::parse(&resolved.url).map_err(|e| {
-        ExecutionError::InvalidRequest(format!("Invalid URL '{}': {e}", resolved.url))
-    })?;
+    // The raw URL is not echoed: it can carry credentials in its query string.
+    let parsed_url = reqwest::Url::parse(&resolved.url)
+        .map_err(|e| ExecutionError::InvalidRequest(format!("Invalid URL: {e}")))?;
     validate_scheme(&parsed_url)?;
-    if options.deny_private_networks {
-        check_private_network_policy(&parsed_url).await?;
-    }
-
-    // 2. Build the request.
-    let method = to_reqwest_method(resolved.method);
-    let mut builder = client.request(method, parsed_url);
-
-    // Add query params.
-    for param in &resolved.params {
-        if param.enabled {
-            builder = builder.query(&[(&param.key, &param.value)]);
-        }
-    }
-
-    // Add headers.
-    for header in &resolved.headers {
-        if header.enabled {
-            builder = builder.header(&header.key, &header.value);
-        }
-    }
-
-    // Add body.
-    if let Some(body) = &resolved.body {
-        builder = builder.body(body.clone());
-    }
-
-    let request = builder
-        .build()
-        .map_err(|e| ExecutionError::InvalidRequest(e.to_string()))?;
-
-    // 3. Execute with cancellation support.
+    let request = build_request(client, &resolved, parsed_url)?;
     let start = Instant::now();
+    let deadline = TokioInstant::now() + Duration::from_secs(TOTAL_TIMEOUT_SECS);
 
-    let mut response = tokio::select! {
-        result = client.execute(request) => {
-            result.map_err(|e| ExecutionError::Network(e.to_string()))?
-        }
-        () = cancel.cancelled() => {
-            return Err(ExecutionError::Cancelled);
-        }
-    };
+    let mut response = send_with_redirects(client, request, &cancel, options, deadline).await?;
 
-    let duration_ms = start.elapsed().as_millis();
-
-    // 4. Extract response data.
     let status_code = response.status().as_u16();
     let http_version = format!("{:?}", response.version());
 
@@ -139,66 +148,22 @@ pub async fn execute_request_with_options(
 
     let content_length = response.content_length();
 
-    let mut body_bytes =
-        Vec::with_capacity(content_length.unwrap_or(0).min(MAX_BODY_SIZE as u64) as usize);
-    let mut truncated = false;
+    let CappedBody {
+        bytes: body_bytes,
+        truncated,
+    } = tokio::time::timeout_at(
+        deadline,
+        read_body_capped(&mut response, content_length, &cancel),
+    )
+    .await
+    .map_err(|_| total_timeout_error())??;
 
-    loop {
-        let next_chunk = tokio::select! {
-            chunk = response.chunk() => {
-                chunk.map_err(|e| ExecutionError::Network(e.to_string()))?
-            }
-            () = cancel.cancelled() => {
-                return Err(ExecutionError::Cancelled);
-            }
-        };
-
-        let Some(chunk) = next_chunk else {
-            break;
-        };
-
-        let remaining = MAX_BODY_SIZE.saturating_sub(body_bytes.len());
-        if remaining == 0 {
-            truncated = true;
-            break;
-        }
-
-        if chunk.len() > remaining {
-            body_bytes.extend_from_slice(&chunk[..remaining]);
-            truncated = true;
-            break;
-        }
-
-        body_bytes.extend_from_slice(&chunk);
-    }
+    // Timed here, not at the header phase: the caller cares about how long the
+    // whole response took to arrive.
+    let duration_ms = start.elapsed().as_millis();
 
     let binary = is_likely_binary(&body_bytes);
-
-    let body_text = if binary {
-        let len = body_bytes.len();
-        Some(format!(
-            "[Binary response: {len} bytes. Press 'w' to save to disk.]"
-        ))
-    } else if truncated {
-        let truncated = String::from_utf8_lossy(&body_bytes);
-        Some(format!(
-            "{truncated}\n\n[truncated at {MAX_BODY_SIZE} bytes]"
-        ))
-    } else {
-        let raw = String::from_utf8_lossy(&body_bytes).into_owned();
-        // Pretty-print JSON if applicable.
-        if content_type
-            .as_deref()
-            .is_some_and(|ct| ct.contains("application/json"))
-        {
-            match serde_json::from_str::<serde_json::Value>(&raw) {
-                Ok(json) => serde_json::to_string_pretty(&json).ok().or(Some(raw)),
-                Err(_) => Some(raw),
-            }
-        } else {
-            Some(raw)
-        }
-    };
+    let body_text = render_body(&body_bytes, content_type.as_deref(), binary);
 
     Ok(ResponseArtifact {
         status_code,
@@ -210,12 +175,279 @@ pub async fn execute_request_with_options(
         body_text,
         body_bytes: binary.then_some(body_bytes),
         is_binary: binary,
+        truncated,
     })
+}
+
+/// Send one request and follow redirects within one cancellable total timeout.
+/// Redirects are handled here, rather than in reqwest's synchronous policy
+/// callback, so DNS validation never blocks a Tokio runtime worker.
+async fn send_with_redirects(
+    client: &reqwest::Client,
+    request: reqwest::Request,
+    cancel: &CancellationToken,
+    options: ExecutionOptions,
+    deadline: TokioInstant,
+) -> Result<reqwest::Response, ExecutionError> {
+    let send = async {
+        let mut request = request;
+        let mut hops = 0;
+
+        loop {
+            if options.deny_private_networks {
+                check_private_network_policy(request.url()).await?;
+            }
+
+            let previous_url = request.url().clone();
+            let Some(mut next_request) = request.try_clone() else {
+                return client.execute(request).await.map_err(network_error);
+            };
+            let response = client.execute(request).await.map_err(network_error)?;
+            let status = response.status();
+            if !is_redirect(status) {
+                return Ok(response);
+            }
+
+            let Some(next_url) = redirect_target(&previous_url, response.headers()) else {
+                return Ok(response);
+            };
+            validate_redirect(&previous_url, &next_url, hops)?;
+
+            rewrite_redirect_request(&mut next_request, status, &previous_url, next_url);
+            request = next_request;
+            hops += 1;
+        }
+    };
+
+    tokio::select! {
+        result = tokio::time::timeout_at(deadline, send) => {
+            result.unwrap_or_else(|_| Err(total_timeout_error()))
+        }
+        () = cancel.cancelled() => Err(ExecutionError::Cancelled),
+    }
+}
+
+fn total_timeout_error() -> ExecutionError {
+    ExecutionError::Network(format!(
+        "request exceeded the {TOTAL_TIMEOUT_SECS}s total timeout"
+    ))
+}
+
+fn is_redirect(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    )
+}
+
+/// Resolve a Location header against the previous URL. Invalid or absent
+/// locations stop redirecting, matching ordinary user-agent behavior.
+fn redirect_target(
+    previous: &reqwest::Url,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<reqwest::Url> {
+    let location = headers.get(LOCATION)?.to_str().ok()?;
+    previous.join(location).ok()
+}
+
+fn validate_redirect(
+    previous: &reqwest::Url,
+    next: &reqwest::Url,
+    hops: usize,
+) -> Result<(), ExecutionError> {
+    if hops >= MAX_REDIRECTS {
+        return Err(ExecutionError::Network(format!(
+            "too many redirects (limit {MAX_REDIRECTS} hops)"
+        )));
+    }
+    validate_scheme(next)?;
+    if previous.scheme() == "https" && next.scheme() == "http" {
+        return Err(ExecutionError::InvalidRequest(
+            "Refusing https -> http redirect: the downgraded hop would travel in cleartext".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Apply the method, body, and credential rules reqwest normally applies when
+/// following a redirect automatically.
+fn rewrite_redirect_request(
+    request: &mut reqwest::Request,
+    status: StatusCode,
+    previous: &reqwest::Url,
+    next: reqwest::Url,
+) {
+    let switch_to_get = matches!(status, StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND)
+        && request.method() == Method::POST
+        || status == StatusCode::SEE_OTHER && request.method() != Method::HEAD;
+    if switch_to_get {
+        *request.method_mut() = Method::GET;
+    }
+    if switch_to_get || status == StatusCode::SEE_OTHER {
+        *request.body_mut() = None;
+        for header in [
+            CONTENT_TYPE,
+            CONTENT_LENGTH,
+            CONTENT_ENCODING,
+            TRANSFER_ENCODING,
+        ] {
+            request.headers_mut().remove(header);
+        }
+    }
+
+    if crosses_host_or_port(previous, &next) {
+        for header in [AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION, WWW_AUTHENTICATE] {
+            request.headers_mut().remove(header);
+        }
+        request.headers_mut().remove("cookie2");
+    }
+
+    if let Some(referer) = redirect_referer(previous, &next) {
+        request.headers_mut().insert(REFERER, referer);
+    }
+    *request.url_mut() = next;
+}
+
+fn crosses_host_or_port(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
+    previous.host_str() != next.host_str()
+        || previous.port_or_known_default() != next.port_or_known_default()
+}
+
+fn redirect_referer(previous: &reqwest::Url, next: &reqwest::Url) -> Option<HeaderValue> {
+    if previous.scheme() == "https" && next.scheme() == "http" {
+        return None;
+    }
+    let mut referer = previous.clone();
+    let _ = referer.set_username("");
+    let _ = referer.set_password(None);
+    referer.set_fragment(None);
+    HeaderValue::from_str(referer.as_str()).ok()
+}
+
+/// Build the outgoing reqwest request from a resolved (interpolated) document.
+fn build_request(
+    client: &reqwest::Client,
+    resolved: &RequestDocument,
+    url: reqwest::Url,
+) -> Result<reqwest::Request, ExecutionError> {
+    let method = to_reqwest_method(resolved.method);
+    let mut builder = client.request(method, url);
+
+    for param in &resolved.params {
+        if param.enabled {
+            builder = builder.query(&[(&param.key, &param.value)]);
+        }
+    }
+
+    for header in &resolved.headers {
+        if header.enabled {
+            builder = builder.header(&header.key, &header.value);
+        }
+    }
+
+    if let Some(body) = &resolved.body {
+        builder = builder.body(body.clone());
+    }
+
+    // `flatten` here too: a bad header value otherwise reports only the
+    // generic "builder error", hiding which header/value was rejected.
+    builder
+        .build()
+        .map_err(|e| ExecutionError::InvalidRequest(flatten(&e.without_url())))
+}
+
+/// Response bytes read under [`MAX_BODY_SIZE`], and whether the cap cut them short.
+struct CappedBody {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+/// Stream the response body until it ends or [`MAX_BODY_SIZE`] is reached.
+async fn read_body_capped(
+    response: &mut reqwest::Response,
+    content_length: Option<u64>,
+    cancel: &CancellationToken,
+) -> Result<CappedBody, ExecutionError> {
+    // Cap the pre-allocation: `Content-Length` is server-controlled, so trusting
+    // it would let a response reserve up to MAX_BODY_SIZE before a byte arrives.
+    let mut bytes = Vec::with_capacity(
+        content_length
+            .unwrap_or(0)
+            .min(INITIAL_BODY_CAPACITY as u64) as usize,
+    );
+
+    loop {
+        let next_chunk = tokio::select! {
+            chunk = response.chunk() => {
+                chunk.map_err(network_error)?
+            }
+            () = cancel.cancelled() => {
+                return Err(ExecutionError::Cancelled);
+            }
+        };
+
+        let Some(chunk) = next_chunk else {
+            break;
+        };
+
+        let remaining = MAX_BODY_SIZE.saturating_sub(bytes.len());
+        if remaining == 0 {
+            return Ok(CappedBody {
+                bytes,
+                truncated: true,
+            });
+        }
+
+        if chunk.len() > remaining {
+            bytes.extend_from_slice(&chunk[..remaining]);
+            return Ok(CappedBody {
+                bytes,
+                truncated: true,
+            });
+        }
+
+        bytes.extend_from_slice(&chunk);
+    }
+
+    Ok(CappedBody {
+        bytes,
+        truncated: false,
+    })
+}
+
+/// Decode a body for display. Binary bodies stay `None`: the placeholder text
+/// is presentation, so each sink writes its own.
+fn render_body(bytes: &[u8], content_type: Option<&str>, binary: bool) -> Option<String> {
+    if binary {
+        return None;
+    }
+
+    let raw = String::from_utf8_lossy(bytes).into_owned();
+    if content_type.is_some_and(|ct| ct.contains("application/json"))
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw)
+    {
+        return serde_json::to_string_pretty(&json).ok().or(Some(raw));
+    }
+    Some(raw)
+}
+
+/// `REQSMITH_DENY_PRIVATE_NETWORKS=1|true` (case-insensitive) turns the
+/// private-network guard on without passing `--deny-private-networks`.
+pub fn deny_private_networks_from_env() -> bool {
+    std::env::var("REQSMITH_DENY_PRIVATE_NETWORKS").is_ok_and(|value| is_truthy(&value))
+}
+
+fn is_truthy(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true")
 }
 
 /// Reject any URL scheme other than `http`/`https`. Applies to every
 /// request regardless of `ExecutionOptions` — this is not opt-in.
-fn validate_scheme(url: &reqwest::Url) -> Result<(), ExecutionError> {
+pub(crate) fn validate_scheme(url: &reqwest::Url) -> Result<(), ExecutionError> {
     match url.scheme() {
         "http" | "https" => Ok(()),
         other => Err(ExecutionError::InvalidRequest(format!(
@@ -246,7 +478,9 @@ async fn check_private_network_policy(url: &reqwest::Url) -> Result<(), Executio
         .host_str()
         .ok_or_else(|| ExecutionError::InvalidRequest("URL is missing a host".into()))?;
 
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    // `host_str` brackets IPv6 literals, so a plain `parse::<IpAddr>()` here
+    // would miss `[::1]` and fall through to the DNS branch.
+    if let Some(ip) = host_ip_literal(host) {
         return if is_private_or_local(&ip) {
             Err(private_network_error(host))
         } else {
@@ -257,19 +491,23 @@ async fn check_private_network_policy(url: &reqwest::Url) -> Result<(), Executio
     let port = url.port_or_known_default().unwrap_or(80);
     let ips: Vec<IpAddr> = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|e| {
-            // Fail closed: with the guard on, an unresolvable host is rejected
-            // rather than handed to reqwest to resolve (and possibly connect)
-            // without a policy check.
-            ExecutionError::InvalidRequest(format!(
-                "Blocked '{host}' by network policy: could not resolve host to \
-                 verify it is not private ({e})"
-            ))
-        })?
+        .map_err(|e| resolve_failure(host, &e))?
         .map(|addr| addr.ip())
         .collect();
 
     evaluate_resolved_ips(host, &ips)
+}
+
+/// Error for a host that could not be resolved while the guard is enabled.
+/// Fail closed: rather than handing an unresolvable host to reqwest to
+/// resolve (and possibly connect) without a policy check, reject it. Factored
+/// out of the `tokio::net::lookup_host` call so it is unit-testable without a
+/// real resolver.
+fn resolve_failure(host: &str, err: &std::io::Error) -> ExecutionError {
+    ExecutionError::InvalidRequest(format!(
+        "Blocked '{host}' by network policy: could not resolve host to \
+         verify it is not private ({err})"
+    ))
 }
 
 /// Policy decision over a host's resolved addresses, factored out of DNS so it
@@ -294,22 +532,58 @@ fn private_network_error(host: &str) -> ExecutionError {
     ))
 }
 
-/// Classify an address as loopback, RFC1918 private, link-local, or IPv6
-/// unique-local (`fc00::/7`).
-fn is_private_or_local(ip: &IpAddr) -> bool {
+/// Parse a URL host as an IP literal, tolerating the bracketed `[::1]` form
+/// that `Url::host_str` returns for IPv6.
+pub(crate) fn host_ip_literal(host: &str) -> Option<IpAddr> {
+    host.strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse()
+        .ok()
+}
+
+/// Classify an address as anything other than public unicast: loopback,
+/// private, link-local, shared/CGNAT, benchmarking, multicast, or reserved.
+///
+/// IPv6 forms that tunnel an IPv4 address (mapped, compatible, 6to4, NAT64)
+/// are classified by the address they embed, so `::ffff:10.0.0.1` and
+/// `2002:a00:1::` are rejected exactly like `10.0.0.1` is.
+pub(crate) fn is_private_or_local(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_unspecified() || v4.is_loopback() || v4.is_private() || v4.is_link_local()
+            let o = v4.octets();
+            v4.is_unspecified()
+                || v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_multicast() // 224.0.0.0/4
+                || o[0] == 0 // "this network" 0.0.0.0/8
+                || (o[0] == 100 && (o[1] & 0xc0) == 64) // shared address space 100.64.0.0/10
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // IETF protocol assignments 192.0.0.0/24
+                || (o[0] == 198 && (o[1] & 0xfe) == 18) // benchmarking 198.18.0.0/15
+                || o[0] >= 240 // reserved 240.0.0.0/4, which contains 255.255.255.255
         }
         IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
+            // `to_ipv4` maps `::1` to `0.0.0.1`, so these must come first.
+            if v6.is_unspecified() || v6.is_loopback() {
+                return true;
+            }
+            if let Some(v4) = v6.to_ipv4() {
                 return is_private_or_local(&IpAddr::V4(v4));
             }
             let o = v6.octets();
-            v6.is_unspecified()
-                || v6.is_loopback()
+            if o[0] == 0x20 && o[1] == 0x02 {
+                // 6to4 2002::/16 embeds the v4 address in the next 32 bits.
+                return is_private_or_local(&IpAddr::V4(Ipv4Addr::new(o[2], o[3], o[4], o[5])));
+            }
+            if o[..12] == [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0] {
+                // NAT64 64:ff9b::/96 embeds the v4 address in the low 32 bits.
+                return is_private_or_local(&IpAddr::V4(Ipv4Addr::new(o[12], o[13], o[14], o[15])));
+            }
+            v6.is_multicast() // ff00::/8
                 || (o[0] & 0xfe) == 0xfc // unique-local fc00::/7
                 || (o[0] == 0xfe && (o[1] & 0xc0) == 0x80) // link-local fe80::/10
+                || (o[0] == 0x20 && o[1] == 0x01 && o[2] == 0 && o[3] == 0) // Teredo 2001::/32
         }
     }
 }
@@ -327,413 +601,5 @@ fn to_reqwest_method(method: HttpMethod) -> reqwest::Method {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::models::KeyValueField;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-        time::{Duration, sleep, timeout},
-    };
-
-    fn simple_doc(url: &str) -> RequestDocument {
-        RequestDocument {
-            name: "Test".into(),
-            method: HttpMethod::Get,
-            url: url.into(),
-            headers: vec![],
-            params: vec![],
-            body: None,
-            auth_plugin: None,
-            assertions: vec![],
-            file_path: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn execute_request_returns_cancelled_when_token_is_already_cancelled() {
-        let client = reqwest::Client::new();
-        let doc = simple_doc("https://httpbin.org/delay/10");
-        let token = CancellationToken::new();
-        token.cancel();
-
-        let result = execute_request(&client, &doc, &HashMap::new(), token).await;
-        assert!(matches!(result, Err(ExecutionError::Cancelled)));
-    }
-
-    #[tokio::test]
-    async fn execute_request_fails_on_unresolved_variables() {
-        let client = reqwest::Client::new();
-        let doc = simple_doc("{{base_url}}/api");
-        let token = CancellationToken::new();
-
-        let result = execute_request(&client, &doc, &HashMap::new(), token).await;
-        assert!(matches!(result, Err(ExecutionError::Interpolation(_))));
-    }
-
-    #[test]
-    fn to_reqwest_method_maps_all_variants() {
-        assert_eq!(to_reqwest_method(HttpMethod::Get), reqwest::Method::GET);
-        assert_eq!(to_reqwest_method(HttpMethod::Post), reqwest::Method::POST);
-        assert_eq!(to_reqwest_method(HttpMethod::Put), reqwest::Method::PUT);
-        assert_eq!(to_reqwest_method(HttpMethod::Patch), reqwest::Method::PATCH);
-        assert_eq!(
-            to_reqwest_method(HttpMethod::Delete),
-            reqwest::Method::DELETE
-        );
-        assert_eq!(to_reqwest_method(HttpMethod::Head), reqwest::Method::HEAD);
-        assert_eq!(
-            to_reqwest_method(HttpMethod::Options),
-            reqwest::Method::OPTIONS
-        );
-    }
-
-    #[test]
-    fn json_pretty_print_works() {
-        let raw = r#"{"key":"value","nested":{"a":1}}"#;
-        let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
-        let pretty = serde_json::to_string_pretty(&parsed).unwrap();
-        assert!(pretty.contains('\n'));
-        assert!(pretty.contains("  "));
-    }
-
-    #[tokio::test]
-    async fn execute_request_adds_headers_and_params() {
-        let client = reqwest::Client::new();
-        let doc = RequestDocument {
-            name: "Test".into(),
-            method: HttpMethod::Get,
-            url: "https://invalid.test.example".into(),
-            headers: vec![KeyValueField {
-                key: "X-Custom".into(),
-                value: "test-value".into(),
-                enabled: true,
-            }],
-            params: vec![
-                KeyValueField {
-                    key: "q".into(),
-                    value: "search".into(),
-                    enabled: true,
-                },
-                KeyValueField {
-                    key: "disabled".into(),
-                    value: "skip".into(),
-                    enabled: false,
-                },
-            ],
-            body: None,
-            auth_plugin: None,
-            assertions: vec![],
-            file_path: None,
-        };
-        let token = CancellationToken::new();
-
-        // This will fail with a network error, but it tests that the request
-        // is built successfully (no panics, no invalid request errors).
-        let result = execute_request(&client, &doc, &HashMap::new(), token).await;
-        assert!(matches!(result, Err(ExecutionError::Network(_))));
-    }
-
-    #[tokio::test]
-    async fn execute_request_returns_after_hitting_body_limit_without_waiting_for_close() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request_buf = [0_u8; 1024];
-            let _ = socket.read(&mut request_buf).await.unwrap();
-
-            let headers = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n",
-                MAX_BODY_SIZE + 100
-            );
-            socket.write_all(headers.as_bytes()).await.unwrap();
-            socket
-                .write_all(&vec![b'a'; MAX_BODY_SIZE + 1])
-                .await
-                .unwrap();
-            sleep(Duration::from_secs(2)).await;
-        });
-
-        let client = reqwest::Client::new();
-        let doc = simple_doc(&format!("http://{addr}"));
-        let token = CancellationToken::new();
-
-        let result = timeout(
-            Duration::from_millis(500),
-            execute_request(&client, &doc, &HashMap::new(), token),
-        )
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "request should finish once the cap is reached"
-        );
-        let artifact = result.unwrap().unwrap();
-        let body = artifact.body_text.unwrap();
-        assert!(body.contains("[truncated at"));
-    }
-
-    #[tokio::test]
-    async fn execute_request_honors_cancellation_while_streaming_body() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request_buf = [0_u8; 1024];
-            let _ = socket.read(&mut request_buf).await.unwrap();
-
-            socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 32\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nhello",
-                )
-                .await
-                .unwrap();
-            sleep(Duration::from_secs(2)).await;
-        });
-
-        let client = reqwest::Client::new();
-        let doc = simple_doc(&format!("http://{addr}"));
-        let token = CancellationToken::new();
-        let cancel = token.clone();
-        tokio::spawn(async move {
-            sleep(Duration::from_millis(50)).await;
-            cancel.cancel();
-        });
-
-        let result = timeout(
-            Duration::from_millis(500),
-            execute_request(&client, &doc, &HashMap::new(), token),
-        )
-        .await;
-
-        assert!(matches!(result, Ok(Err(ExecutionError::Cancelled))));
-    }
-
-    // --- B2: scheme allowlist ---
-
-    #[test]
-    fn validate_scheme_allows_http_and_https() {
-        let http = reqwest::Url::parse("http://example.com").unwrap();
-        let https = reqwest::Url::parse("https://example.com").unwrap();
-        assert!(validate_scheme(&http).is_ok());
-        assert!(validate_scheme(&https).is_ok());
-    }
-
-    #[test]
-    fn validate_scheme_rejects_other_schemes() {
-        let file_url = reqwest::Url::parse("file:///etc/passwd").unwrap();
-        let ftp_url = reqwest::Url::parse("ftp://example.com/file").unwrap();
-        assert!(matches!(
-            validate_scheme(&file_url),
-            Err(ExecutionError::InvalidRequest(_))
-        ));
-        assert!(matches!(
-            validate_scheme(&ftp_url),
-            Err(ExecutionError::InvalidRequest(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn execute_request_rejects_non_http_scheme() {
-        let client = reqwest::Client::new();
-        let doc = simple_doc("ftp://example.com/file");
-        let result =
-            execute_request(&client, &doc, &HashMap::new(), CancellationToken::new()).await;
-        assert!(matches!(result, Err(ExecutionError::InvalidRequest(_))));
-    }
-
-    // --- B2: private-network policy (opt-in) ---
-
-    #[test]
-    fn is_private_or_local_classifies_v4_addresses() {
-        assert!(is_private_or_local(&"0.0.0.0".parse::<IpAddr>().unwrap()));
-        assert!(is_private_or_local(&"127.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_or_local(&"10.1.2.3".parse::<IpAddr>().unwrap()));
-        assert!(is_private_or_local(
-            &"172.16.0.1".parse::<IpAddr>().unwrap()
-        ));
-        assert!(is_private_or_local(
-            &"192.168.1.1".parse::<IpAddr>().unwrap()
-        ));
-        assert!(is_private_or_local(
-            &"169.254.1.1".parse::<IpAddr>().unwrap()
-        ));
-        assert!(!is_private_or_local(&"8.8.8.8".parse::<IpAddr>().unwrap()));
-    }
-
-    #[test]
-    fn is_private_or_local_classifies_v6_addresses() {
-        assert!(is_private_or_local(&"::".parse::<IpAddr>().unwrap()));
-        assert!(is_private_or_local(&"::1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_or_local(
-            &"::ffff:127.0.0.1".parse::<IpAddr>().unwrap()
-        ));
-        assert!(is_private_or_local(
-            &"::ffff:192.168.1.1".parse::<IpAddr>().unwrap()
-        ));
-        assert!(is_private_or_local(&"fc00::1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_or_local(
-            &"fd12:3456::1".parse::<IpAddr>().unwrap()
-        ));
-        assert!(is_private_or_local(&"fe80::1".parse::<IpAddr>().unwrap()));
-        assert!(!is_private_or_local(
-            &"2001:4860:4860::8888".parse::<IpAddr>().unwrap()
-        ));
-    }
-
-    #[tokio::test]
-    async fn execute_request_allows_loopback_by_default() {
-        // Default options (deny_private_networks: false) must not block
-        // localhost; this is the primary use case for a local API client.
-        let client = reqwest::Client::new();
-        let doc = simple_doc("http://127.0.0.1:9");
-        let result =
-            execute_request(&client, &doc, &HashMap::new(), CancellationToken::new()).await;
-        // Not blocked by policy -> fails with a network error (closed port),
-        // never InvalidRequest.
-        assert!(matches!(result, Err(ExecutionError::Network(_))));
-    }
-
-    #[tokio::test]
-    async fn execute_request_with_options_denies_loopback_when_opted_in() {
-        let client = reqwest::Client::new();
-        let doc = simple_doc("http://127.0.0.1:9");
-        let options = ExecutionOptions {
-            deny_private_networks: true,
-        };
-        let result = execute_request_with_options(
-            &client,
-            &doc,
-            &HashMap::new(),
-            CancellationToken::new(),
-            options,
-        )
-        .await;
-        assert!(matches!(result, Err(ExecutionError::InvalidRequest(_))));
-    }
-
-    #[test]
-    fn evaluate_resolved_ips_rejects_any_private_among_public() {
-        let mixed = [
-            "8.8.8.8".parse::<IpAddr>().unwrap(),
-            "10.0.0.5".parse::<IpAddr>().unwrap(),
-        ];
-        assert!(matches!(
-            evaluate_resolved_ips("mixed.example", &mixed),
-            Err(ExecutionError::InvalidRequest(_))
-        ));
-    }
-
-    #[test]
-    fn evaluate_resolved_ips_allows_all_public() {
-        let public = [
-            "8.8.8.8".parse::<IpAddr>().unwrap(),
-            "1.1.1.1".parse::<IpAddr>().unwrap(),
-        ];
-        assert!(evaluate_resolved_ips("public.example", &public).is_ok());
-    }
-
-    #[test]
-    fn evaluate_resolved_ips_fails_closed_on_empty_resolution() {
-        assert!(matches!(
-            evaluate_resolved_ips("unresolvable.example", &[]),
-            Err(ExecutionError::InvalidRequest(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn check_private_network_policy_allows_public_ip_literal() {
-        // Exercise the policy check directly (no real network connection
-        // involved, unlike routing through `execute_request`) so this test
-        // is deterministic in a sandboxed/offline CI environment.
-        let url = reqwest::Url::parse("http://93.184.216.34:9").unwrap();
-        assert!(check_private_network_policy(&url).await.is_ok());
-    }
-
-    // --- B2: critical regression — redirect must not leak Authorization
-    // across an origin change (reqwest strips it automatically; this test
-    // locks in that guarantee for a same-host, different-port redirect). ---
-
-    #[tokio::test]
-    async fn redirect_strips_authorization_header_across_port_change() {
-        use tokio::sync::oneshot;
-
-        // Second listener: the redirect target. Captures whatever raw
-        // request headers it receives.
-        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let target_addr = target_listener.local_addr().unwrap();
-        let (captured_tx, captured_rx) = oneshot::channel::<String>();
-
-        tokio::spawn(async move {
-            let (mut socket, _) = target_listener.accept().await.unwrap();
-            let mut buf = vec![0_u8; 4096];
-            let n = socket.read(&mut buf).await.unwrap();
-            let request_text = String::from_utf8_lossy(&buf[..n]).to_string();
-            socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
-                .await
-                .unwrap();
-            let _ = captured_tx.send(request_text);
-        });
-
-        // First listener: returns a 301 redirect to the second listener's
-        // port on the SAME host — an origin change reqwest must treat as
-        // cross-origin for the purposes of stripping sensitive headers.
-        let redirect_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let redirect_addr = redirect_listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let (mut socket, _) = redirect_listener.accept().await.unwrap();
-            let mut buf = [0_u8; 1024];
-            let _ = socket.read(&mut buf).await.unwrap();
-            let response = format!(
-                "HTTP/1.1 301 Moved Permanently\r\nLocation: http://127.0.0.1:{}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                target_addr.port()
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-        });
-
-        let client = crate::infra::http_client::build_client().unwrap();
-        let doc = RequestDocument {
-            name: "Redirect".into(),
-            method: HttpMethod::Get,
-            url: format!("http://{redirect_addr}"),
-            headers: vec![crate::core::models::KeyValueField {
-                key: "Authorization".into(),
-                value: "Bearer super-secret-token".into(),
-                enabled: true,
-            }],
-            params: vec![],
-            body: None,
-            auth_plugin: None,
-            assertions: vec![],
-            file_path: None,
-        };
-
-        let token = CancellationToken::new();
-        let result = timeout(
-            Duration::from_secs(2),
-            execute_request(&client, &doc, &HashMap::new(), token),
-        )
-        .await
-        .expect("request should complete before timeout")
-        .expect("redirected request should succeed");
-
-        assert_eq!(result.status_code, 200);
-
-        let captured = timeout(Duration::from_secs(1), captured_rx)
-            .await
-            .expect("target listener should receive the redirected request")
-            .expect("capture channel should not be dropped");
-
-        let lower = captured.to_lowercase();
-        assert!(
-            !lower.contains("authorization"),
-            "reqwest must strip Authorization on a cross-port redirect, but the \
-             second listener received it:\n{captured}"
-        );
-    }
-}
+#[path = "execution_tests.rs"]
+mod tests;

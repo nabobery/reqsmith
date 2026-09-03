@@ -24,21 +24,52 @@ reproducible):
 cargo build --locked
 ```
 
-Run the full local CI suite (formatting check, clippy, and tests) before
-opening a PR:
+Run the local CI suite before opening a PR:
 
 ```bash
-just ci
+just ci        # fmt-check + lint + test — needs only a Rust toolchain
+just ci-full   # everything CI runs: ci + audit + deny + secrets
 ```
 
-If you don't have [`just`](https://github.com/casey/just) installed, you can
-run the equivalent commands directly:
+`just ci-full` additionally needs [`cargo-audit`], [`cargo-deny`], and
+[`gitleaks`] on your `PATH`; `just ci` needs none of them, so use `ci` for the
+fast loop and `ci-full` (or the PR's CI run) before you request review.
+
+[`cargo-audit`]: https://github.com/rustsec/rustsec/tree/main/cargo-audit
+[`cargo-deny`]: https://github.com/EmbarkStudios/cargo-deny
+[`gitleaks`]: https://github.com/gitleaks/gitleaks
+
+If you don't have [`just`](https://github.com/casey/just) installed, these are
+the exact commands the recipes run:
 
 ```bash
-cargo fmt -- --check
+# just fmt-check
+cargo fmt --all -- --check
+
+# just lint
+cargo clippy --all-targets --locked -- -D warnings
 cargo clippy --all-targets --all-features --locked -- -D warnings
+
+# just test
 cargo test --locked
+cargo test --locked --all-features
+
+# just audit  (ignore chain mirrors .github/workflows/checks.yml)
+cargo audit \
+  --ignore RUSTSEC-2026-0222 --ignore RUSTSEC-2026-0269 \
+  --ignore RUSTSEC-2026-0247 --ignore RUSTSEC-2026-0250 \
+  --ignore RUSTSEC-2026-0251 --ignore RUSTSEC-2026-0255 \
+  --ignore RUSTSEC-2026-0253
+
+# just deny
+cargo deny --all-features check
+
+# just secrets  (the dir scan also walks target/ locally)
+gitleaks git --redact --no-banner .
+gitleaks dir --redact --no-banner .
 ```
+
+Run `just --list` to see every recipe.
 
 ## MSRV
 
@@ -46,7 +77,8 @@ The **default build** targets Rust **1.88** as the minimum supported version.
 Avoid using language or standard-library features newer than that in code that
 compiles under default features, unless the MSRV is bumped as part of the same
 change (and documented in `Cargo.toml` and the CHANGELOG). CI enforces this with
-a dedicated `msrv (1.88)` job that builds default features on Rust 1.88.
+a dedicated `msrv` job that runs `cargo check --locked --all-targets` on Rust
+1.88 with default features.
 
 The optional **`plugins` feature** depends on extism/wasmtime and requires
 **Rust >= 1.91**. That floor applies only to `--features plugins` /
@@ -76,8 +108,9 @@ cargo test --locked --all-features
 
 Before opening a PR:
 
-- [ ] `just ci` passes locally (or the equivalent `fmt` / `clippy` / `test`
-      commands above).
+- [ ] `just ci` passes locally (or the equivalent `fmt-check` / `lint` /
+      `test` commands above); `just ci-full` if you have cargo-audit,
+      cargo-deny, and gitleaks installed.
 - [ ] Tests were added or updated for the change.
 - [ ] The description explains **why** the change is needed, not just what
       changed, and links any related issue.

@@ -7,10 +7,13 @@
 //! first so secrets never reach stdout, a stored run snapshot, or a log
 //! line.
 
+use std::borrow::Cow;
 use std::env;
 
+use sha2::{Digest, Sha256};
+
 /// Default set of header names considered sensitive. Matching is
-/// case-insensitive (see [`is_sensitive_header`]).
+/// case-insensitive (see [`RedactionPolicy::is_sensitive`]).
 const DEFAULT_SENSITIVE_HEADERS: &[&str] = &[
     "authorization",
     "proxy-authorization",
@@ -22,14 +25,26 @@ const DEFAULT_SENSITIVE_HEADERS: &[&str] = &[
     "x-amz-security-token",
     "www-authenticate",
     "authentication",
+    "x-csrf-token",
+    "x-xsrf-token",
+    "x-amz-signature",
+    "private-token",
+    "x-hub-signature",
+    // Config-style key names, so the same policy can mask secrets in
+    // key/value configuration as well as in HTTP headers.
+    "secret",
+    "token",
+    "password",
+    "client_secret",
 ];
 
 /// Name of the environment variable used to extend the default sensitive-header
 /// set with additional, comma-separated header names.
 pub const REDACT_HEADERS_ENV_VAR: &str = "REQSMITH_REDACT_HEADERS";
 
-/// The literal placeholder written in place of a redacted header value.
-const REDACTED_VALUE: &str = "<redacted>";
+/// Prefix every redacted value starts with, so callers, tests and docs can
+/// recognize a placeholder without depending on the digest that follows.
+pub const REDACTED_PREFIX: &str = "<redacted:";
 
 /// A resolved redaction policy: the default sensitive-header set plus any
 /// extra names configured via `REQSMITH_REDACT_HEADERS`, parsed **once**.
@@ -72,18 +87,42 @@ impl RedactionPolicy {
     pub fn redact_headers(&self, headers: &[(String, String)]) -> Vec<(String, String)> {
         headers
             .iter()
-            .map(|(key, value)| (key.clone(), self.redact_value_for(key, value)))
+            .map(|(key, value)| (key.clone(), self.redact_value_for(key, value).into_owned()))
             .collect()
     }
 
-    /// The placeholder if `key` is sensitive, otherwise `value` unchanged.
-    pub fn redact_value_for(&self, key: &str, value: &str) -> String {
-        if self.is_sensitive(key) {
-            REDACTED_VALUE.to_string()
-        } else {
-            value.to_string()
+    /// The placeholder if `key` is sensitive, otherwise `value` borrowed unchanged.
+    pub fn redact_value_for<'a>(&self, key: &str, value: &'a str) -> Cow<'a, str> {
+        if !self.is_sensitive(key) {
+            return Cow::Borrowed(value);
         }
+        // Already a placeholder (e.g. loaded from a stored snapshot): redaction
+        // must be idempotent, or re-hashing it on every diff/display would make
+        // `reqsmith diff` show a fingerprint that doesn't match what's on disk.
+        if value.starts_with(REDACTED_PREFIX) {
+            return Cow::Borrowed(value);
+        }
+        Cow::Owned(placeholder_for(value))
     }
+}
+
+/// The placeholder for `value`: a truncated SHA-256 fingerprint rather than a
+/// flat marker, so two different secrets get two different placeholders and a
+/// rotated secret still shows up as *changed* when two stored snapshots (which
+/// only ever hold the placeholder) are diffed.
+///
+/// The digest is unsalted and truncated to 4 bytes, so it is a fingerprint,
+/// not a blindfold: a low-entropy value (e.g. `Authorization: Basic
+/// dXNlcjpwYXNz`, a short PIN, a value drawn from a small known set) can be
+/// confirmed offline by hashing candidates and comparing against the
+/// published hex characters. See `docs/security-model.md`.
+fn placeholder_for(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    let fingerprint: String = digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{REDACTED_PREFIX}sha256:{fingerprint}>")
 }
 
 fn parse_extra_headers(env_value: &str) -> Vec<String> {
@@ -95,38 +134,9 @@ fn parse_extra_headers(env_value: &str) -> Vec<String> {
         .collect()
 }
 
-/// Returns the placeholder string used in place of a redacted header value.
-// Part of the module's convenience API (and used in tests); most sinks go
-// through `RedactionPolicy` / `redact_headers` instead.
-#[allow(dead_code)]
-pub fn redact_value() -> &'static str {
-    REDACTED_VALUE
-}
-
-/// Returns `true` if `name` matches a default sensitive header, or one added
-/// via the `REQSMITH_REDACT_HEADERS` environment variable.
-///
-/// Convenience wrapper over [`RedactionPolicy`]; it builds a policy (one env
-/// read) per call. In a loop over many headers, build a [`RedactionPolicy`]
-/// once and call [`RedactionPolicy::is_sensitive`] instead.
-#[allow(dead_code)]
-pub fn is_sensitive_header(name: &str) -> bool {
-    RedactionPolicy::from_env().is_sensitive(name)
-}
-
-/// Pure matching logic, independent of the environment, so it can be unit
-/// tested without racing other tests over a process-global env var.
-#[cfg(test)]
-fn is_sensitive_header_inner(name: &str, extra_env: Option<&str>) -> bool {
-    RedactionPolicy {
-        extra: extra_env.map(parse_extra_headers).unwrap_or_default(),
-    }
-    .is_sensitive(name)
-}
-
-/// Return a copy of `headers` with sensitive values replaced by
-/// [`redact_value`]. Header names and ordering are preserved; non-sensitive
-/// values pass through untouched. Reads the environment once (via
+/// Return a copy of `headers` with sensitive values replaced by a redaction
+/// placeholder. Header names and ordering are preserved; non-sensitive values
+/// pass through untouched. Reads the environment once (via
 /// [`RedactionPolicy::from_env`]), not once per header.
 pub fn redact_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     RedactionPolicy::from_env().redact_headers(headers)
@@ -141,46 +151,55 @@ mod tests {
     // REQSMITH_REDACT_HEADERS env var, so it can't race other tests in this file.
     static ENV_GUARD: Mutex<()> = Mutex::new(());
 
+    fn policy_with(extra: &str) -> RedactionPolicy {
+        RedactionPolicy {
+            extra: parse_extra_headers(extra),
+        }
+    }
+
     #[test]
     fn detects_default_sensitive_headers_case_insensitively() {
-        assert!(is_sensitive_header("Authorization"));
-        assert!(is_sensitive_header("AUTHORIZATION"));
-        assert!(is_sensitive_header("authorization"));
-        assert!(is_sensitive_header("Set-Cookie"));
-        assert!(is_sensitive_header("set-cookie"));
-        assert!(is_sensitive_header("Proxy-Authorization"));
-        assert!(is_sensitive_header("X-Api-Key"));
-        assert!(is_sensitive_header("Api-Key"));
-        assert!(is_sensitive_header("X-Auth-Token"));
-        assert!(is_sensitive_header("X-Amz-Security-Token"));
-        assert!(is_sensitive_header("WWW-Authenticate"));
-        assert!(is_sensitive_header("Authentication"));
-        assert!(is_sensitive_header("Cookie"));
-        assert!(!is_sensitive_header("content-type"));
-        assert!(!is_sensitive_header("x-request-id"));
+        let policy = RedactionPolicy::default();
+        for name in [
+            "Authorization",
+            "AUTHORIZATION",
+            "authorization",
+            "Set-Cookie",
+            "set-cookie",
+            "Proxy-Authorization",
+            "X-Api-Key",
+            "Api-Key",
+            "X-Auth-Token",
+            "X-Amz-Security-Token",
+            "WWW-Authenticate",
+            "Authentication",
+            "Cookie",
+            "X-Csrf-Token",
+            "x-xsrf-token",
+            "X-Amz-Signature",
+            "private-token",
+            "X-Hub-Signature",
+            "secret",
+            "TOKEN",
+            "password",
+            "client_secret",
+        ] {
+            assert!(policy.is_sensitive(name), "{name} should be sensitive");
+        }
+        assert!(!policy.is_sensitive("content-type"));
+        assert!(!policy.is_sensitive("x-request-id"));
     }
 
     #[test]
     fn env_extension_logic_merges_with_defaults() {
-        assert!(is_sensitive_header_inner(
-            "x-custom-secret",
-            Some("x-custom-secret, x-other-secret")
-        ));
-        assert!(is_sensitive_header_inner(
-            "X-OTHER-SECRET",
-            Some("x-custom-secret, x-other-secret")
-        ));
-        assert!(!is_sensitive_header_inner(
-            "x-unrelated",
-            Some("x-custom-secret")
-        ));
+        let extended = policy_with("x-custom-secret, x-other-secret");
+        assert!(extended.is_sensitive("x-custom-secret"));
+        assert!(extended.is_sensitive("X-OTHER-SECRET"));
+        assert!(!extended.is_sensitive("x-unrelated"));
         // Defaults still apply even when an extension list is present.
-        assert!(is_sensitive_header_inner(
-            "authorization",
-            Some("x-custom-secret")
-        ));
+        assert!(extended.is_sensitive("authorization"));
         // No extension configured: only defaults match.
-        assert!(!is_sensitive_header_inner("x-custom-secret", None));
+        assert!(!RedactionPolicy::default().is_sensitive("x-custom-secret"));
     }
 
     #[test]
@@ -194,9 +213,10 @@ mod tests {
             env::set_var(REDACT_HEADERS_ENV_VAR, "x-internal-token, x-tenant-secret");
         }
 
-        assert!(is_sensitive_header("x-internal-token"));
-        assert!(is_sensitive_header("X-Tenant-Secret"));
-        assert!(!is_sensitive_header("x-not-listed"));
+        let policy = RedactionPolicy::from_env();
+        assert!(policy.is_sensitive("x-internal-token"));
+        assert!(policy.is_sensitive("X-Tenant-Secret"));
+        assert!(!policy.is_sensitive("x-not-listed"));
 
         unsafe {
             match &previous {
@@ -207,8 +227,49 @@ mod tests {
     }
 
     #[test]
-    fn redact_value_returns_placeholder() {
-        assert_eq!(redact_value(), "<redacted>");
+    fn placeholder_is_a_truncated_digest_and_hides_the_value() {
+        let placeholder = placeholder_for("Bearer super-secret");
+        assert!(placeholder.starts_with(REDACTED_PREFIX));
+        assert!(!placeholder.contains("super-secret"));
+        assert_eq!(placeholder.len(), "<redacted:sha256:>".len() + 8);
+        // sha256("Bearer super-secret") starts with these bytes.
+        let expected = {
+            let digest = Sha256::digest(b"Bearer super-secret");
+            format!(
+                "<redacted:sha256:{:02x}{:02x}{:02x}{:02x}>",
+                digest[0], digest[1], digest[2], digest[3]
+            )
+        };
+        assert_eq!(placeholder, expected);
+    }
+
+    #[test]
+    fn distinct_values_get_distinct_placeholders_and_equal_values_match() {
+        let policy = RedactionPolicy::default();
+        let old = policy.redact_value_for("set-cookie", "session=old-secret");
+        let new = policy.redact_value_for("set-cookie", "session=new-secret");
+        let again = policy.redact_value_for("set-cookie", "session=old-secret");
+
+        assert_ne!(old, new, "a rotated secret must change its placeholder");
+        assert_eq!(old, again, "the same secret must be stable across calls");
+        for rendered in [&old, &new] {
+            assert!(rendered.starts_with(REDACTED_PREFIX));
+            assert!(!rendered.contains("old-secret"));
+            assert!(!rendered.contains("new-secret"));
+        }
+    }
+
+    #[test]
+    fn non_sensitive_values_are_borrowed_not_copied() {
+        let policy = RedactionPolicy::default();
+        assert!(matches!(
+            policy.redact_value_for("content-type", "application/json"),
+            Cow::Borrowed("application/json")
+        ));
+        assert!(matches!(
+            policy.redact_value_for("authorization", "Bearer x"),
+            Cow::Owned(_)
+        ));
     }
 
     #[test]
@@ -219,18 +280,19 @@ mod tests {
             ("Set-Cookie".to_string(), "session=abc123".to_string()),
         ];
         let redacted = redact_headers(&headers);
-        assert_eq!(
-            redacted[0],
-            ("Authorization".to_string(), "<redacted>".to_string())
-        );
+
+        assert_eq!(redacted[0].0, "Authorization");
+        assert!(redacted[0].1.starts_with(REDACTED_PREFIX));
         assert_eq!(
             redacted[1],
             ("Content-Type".to_string(), "application/json".to_string())
         );
-        assert_eq!(
-            redacted[2],
-            ("Set-Cookie".to_string(), "<redacted>".to_string())
-        );
+        assert_eq!(redacted[2].0, "Set-Cookie");
+        assert!(redacted[2].1.starts_with(REDACTED_PREFIX));
+
+        let rendered = format!("{redacted:?}");
+        assert!(!rendered.contains("secret123"));
+        assert!(!rendered.contains("abc123"));
     }
 
     #[test]
@@ -239,9 +301,7 @@ mod tests {
         assert!(default_policy.is_sensitive("Authorization"));
         assert!(!default_policy.is_sensitive("x-custom-secret"));
 
-        let extended = RedactionPolicy {
-            extra: parse_extra_headers("x-custom-secret, x-other"),
-        };
+        let extended = policy_with("x-custom-secret, x-other");
         assert!(extended.is_sensitive("X-Custom-Secret"));
         assert!(extended.is_sensitive("x-other"));
         // Defaults still apply through a policy with extras.
@@ -252,8 +312,20 @@ mod tests {
             ("X-Custom-Secret".into(), "shhh".into()),
             ("Content-Type".into(), "text/plain".into()),
         ]);
-        assert_eq!(redacted[0].1, "<redacted>");
+        assert!(redacted[0].1.starts_with(REDACTED_PREFIX));
+        assert!(!redacted[0].1.contains("shhh"));
         assert_eq!(redacted[1].1, "text/plain");
+    }
+
+    #[test]
+    fn redacting_an_already_redacted_value_is_a_no_op() {
+        let policy = RedactionPolicy::default();
+        let once = policy.redact_value_for("authorization", "Bearer secret");
+        let twice = policy.redact_value_for("authorization", &once);
+        assert_eq!(
+            once, twice,
+            "re-redacting a placeholder must not re-hash it"
+        );
     }
 
     #[test]

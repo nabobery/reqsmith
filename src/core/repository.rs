@@ -7,7 +7,6 @@ use walkdir::WalkDir;
 use super::atomic_write;
 use super::models::{CollectionNode, CollectionNodeKind, RequestDocument};
 
-#[allow(dead_code)] // Used in Step 6 when collections pane is wired up.
 /// Directories to skip during collection discovery.
 const IGNORED_DIRS: &[&str] = &[
     ".git",
@@ -21,7 +20,6 @@ const IGNORED_DIRS: &[&str] = &[
     "vendor",
 ];
 
-#[allow(dead_code)] // Used in Step 6.
 /// Recursively discover `.req.yml` files from `cwd`, returning a tree of
 /// collection nodes grouped by directory.
 pub fn discover_requests(cwd: &Path) -> Result<Vec<CollectionNode>> {
@@ -50,7 +48,6 @@ pub fn discover_requests(cwd: &Path) -> Result<Vec<CollectionNode>> {
     build_tree(cwd, &file_paths)
 }
 
-#[allow(dead_code)] // Used in Step 5.
 /// Load a request document from a YAML file.
 pub fn load_request(path: &Path) -> Result<RequestDocument> {
     let content =
@@ -61,7 +58,6 @@ pub fn load_request(path: &Path) -> Result<RequestDocument> {
     Ok(doc)
 }
 
-#[allow(dead_code)] // Used in Step 5.
 /// Save a request document to a YAML file using an atomic, symlink-refusing
 /// write (shared with the rest of reqsmith's on-disk writes; see
 /// [`atomic_write`]).
@@ -75,7 +71,6 @@ pub fn save_request(doc: &RequestDocument, path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
 /// Build a directory tree from a flat list of file paths relative to `root`.
 fn build_tree(root: &Path, file_paths: &[PathBuf]) -> Result<Vec<CollectionNode>> {
     let mut top_level: Vec<CollectionNode> = Vec::new();
@@ -93,7 +88,6 @@ fn build_tree(root: &Path, file_paths: &[PathBuf]) -> Result<Vec<CollectionNode>
     Ok(top_level)
 }
 
-#[allow(dead_code)]
 fn insert_into_tree(
     nodes: &mut Vec<CollectionNode>,
     full_path: &Path,
@@ -275,6 +269,25 @@ mod tests {
         assert_eq!(loaded.url, doc.url);
         assert_eq!(loaded.headers, doc.headers);
         assert_eq!(loaded.body, doc.body);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_request_refuses_a_symlinked_request_file() {
+        let tmp = create_temp_dir();
+        write_request_file(tmp.path(), "real");
+        let target = tmp.path().join("real.req.yml");
+        let original = fs::read_to_string(&target).unwrap();
+        let link = tmp.path().join("link.req.yml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut doc = load_request(&target).unwrap();
+        doc.name = "Overwritten".into();
+
+        let err = format!("{:#}", save_request(&doc, &link).unwrap_err());
+        assert!(err.contains("is a symlink"), "{err}");
+        // The file behind the link must be byte-for-byte untouched.
+        assert_eq!(fs::read_to_string(&target).unwrap(), original);
     }
 
     #[test]

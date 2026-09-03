@@ -22,8 +22,16 @@
 //!   sees [`std::io::ErrorKind::AlreadyExists`] and picks another name.
 //! * **No leaked temp files.** The temp file (and, for `write_new`, the
 //!   reservation) is removed on any write/rename failure.
+//! * **Restrictive temp file.** On Unix the temp file is created `0600` and,
+//!   when replacing an existing file, inherits that file's permission bits, so
+//!   a `chmod 600` request file does not come back as `0644`.
 //! * **Crash durability.** After the rename we best-effort `fsync` the
 //!   containing directory so the new entry survives a power loss.
+//!
+//! Windows caveats: renaming over a file another process holds open can fail
+//! with a sharing violation, so a replace is not as reliably atomic there as on
+//! Unix. `Path::is_symlink`/`symlink_metadata` also do not flag directory
+//! junctions, so the symlink refusal below does not cover them.
 //!
 //! What this module deliberately does *not* defend against: a fully
 //! attacker-controlled *parent directory tree* (e.g. `.reqsmith/runs` swapped for
@@ -70,10 +78,47 @@ fn symlink_refused(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
         format!(
-            "refusing to write through pre-existing symlink at {}",
+            "{} is a symlink; reqsmith writes only to regular files. \
+             Edit the target directly or replace the link with a file.",
             path.display()
         ),
     )
+}
+
+/// Create the temp file the payload is staged in, `0600` on Unix.
+///
+/// A collision on the *temp* name is remapped away from `AlreadyExists`: that
+/// kind is reserved for the destination colliding, which callers retry past
+/// under a different name (see [`crate::core::storage`]).
+fn create_temp_file(tmp_path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(tmp_path).map_err(|e| {
+        io::Error::other(format!(
+            "failed to create temp file {}: {e}",
+            tmp_path.display()
+        ))
+    })
+}
+
+/// Atomically reserve `path` as a new, empty file, `0600` on Unix — same mode
+/// logic as [`create_temp_file`], so the reservation is never briefly wider
+/// (e.g. the process umask) for the window between reserving the name and the
+/// rename that fills it in.
+fn reserve_destination(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 fn write_impl(path: &Path, data: &[u8], mode: Mode) -> io::Result<()> {
@@ -115,7 +160,7 @@ fn write_impl(path: &Path, data: &[u8], mode: Mode) -> io::Result<()> {
     //    AlreadyExists and can pick a different name.
     let mut reserved = false;
     if mode == Mode::CreateNew {
-        match OpenOptions::new().write(true).create_new(true).open(path) {
+        match reserve_destination(path) {
             Ok(_) => reserved = true,
             // `create_new` also rejects an existing symlink with EEXIST; we've
             // already handled that above, so any AlreadyExists here is a real
@@ -130,10 +175,22 @@ fn write_impl(path: &Path, data: &[u8], mode: Mode) -> io::Result<()> {
     let tmp_path = dir.join(format!(".{file_name}.tmp-{}-{unique}", std::process::id()));
 
     let write_result = (|| -> io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)?;
+        let mut file = create_temp_file(&tmp_path)?;
+        // Carry the destination's mode over, so replacing a `chmod 600` file
+        // doesn't silently widen it to the temp file's 0600 default (or, on a
+        // deliberately group-readable file, narrow it).
+        // `symlink_metadata` (not `metadata`) so a symlink swapped in after the
+        // refusal check above can't steer this into copying an attacker's
+        // file's mode; masked to the permission bits so no other `st_mode`
+        // bits (file type, setuid/setgid/sticky) leak onto the temp file.
+        #[cfg(unix)]
+        if mode == Mode::Overwrite
+            && let Ok(meta) = std::fs::symlink_metadata(path)
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let masked = meta.permissions().mode() & 0o7777;
+            file.set_permissions(std::fs::Permissions::from_mode(masked))?;
+        }
         file.write_all(data)?;
         file.sync_all()?;
         Ok(())
@@ -236,6 +293,87 @@ mod tests {
 
         assert!(write_replace(&link, b"attacker").is_err());
         assert_eq!(std::fs::read(&real).unwrap(), b"original");
+    }
+
+    #[test]
+    fn temp_file_collision_is_not_reported_as_a_destination_collision() {
+        // The real temp name embeds a process-global counter, so the helper is
+        // exercised directly rather than racing to predict that name.
+        let tmp = tempfile::tempdir().unwrap();
+        let planted = tmp.path().join(".a.json.tmp-squatter");
+        std::fs::write(&planted, b"squatter").unwrap();
+
+        let err = create_temp_file(&planted).unwrap_err();
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::AlreadyExists,
+            "a temp-name collision must not look like a destination collision the caller retries past"
+        );
+        assert!(err.to_string().contains(".a.json.tmp-squatter"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_new_creates_the_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.json");
+        write_new(&path, b"secret").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "got {:o}", mode & 0o777);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reservation_file_is_never_wider_than_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Checked directly on the reservation file itself (before any rename
+        // fills it in), not just on the post-rename result: the destination's
+        // final mode always comes from the 0600 temp file regardless of the
+        // reservation's mode, so only inspecting it after `write_new`
+        // completes would not catch the reservation briefly sitting at the
+        // process umask (commonly 0644) during the write window.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.json");
+
+        reserve_destination(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "got {:o}", mode & 0o777);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_replace_preserves_the_destination_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.yml");
+        std::fs::write(&path, b"first").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_replace(&path, b"second").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "got {:o}", mode & 0o777);
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_refusal_says_what_to_do() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::write(&real, b"original").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let message = write_replace(&link, b"attacker").unwrap_err().to_string();
+        assert!(message.contains("is a symlink"), "{message}");
+        assert!(message.contains("regular files"), "{message}");
+        assert!(message.contains("Edit the target directly"), "{message}");
     }
 
     #[cfg(unix)]

@@ -38,14 +38,24 @@ Two things can go wrong with plugins, and reqsmith treats them differently:
 
 ## C1 — Project-local plugins require explicit opt-in
 
-reqsmith looks for `plugins.toml` in two places, in order:
+reqsmith reads `plugins.toml` from **both** of these locations, project-local
+first:
 
 1. `$cwd/.reqsmith/plugins.toml` — **project-local**. This file (and the `.wasm`
    files it points to) can arrive as part of a cloned/downloaded repository,
    so reqsmith treats it as **untrusted by default**.
-2. `$XDG_CONFIG_HOME/reqsmith/plugins.toml` (typically `~/.config/reqsmith/plugins.toml`)
-   — **user-global**. You placed this file yourself, so it's trusted the way
-   it always has been: it loads and runs its plugins normally.
+2. `dirs::config_dir()/reqsmith/plugins.toml` — **user-global**: on Linux,
+   `$XDG_CONFIG_HOME/reqsmith/plugins.toml` (default `~/.config/reqsmith/plugins.toml`);
+   on macOS, `~/Library/Application Support/reqsmith/plugins.toml`. You placed
+   this file yourself, so it's trusted: it loads and runs its plugins normally.
+
+Both are loaded, and their entries are merged into one registry. A repository
+cannot disable your global plugins simply by shipping a `plugins.toml` of its
+own — only the project-local file is ever gated. If a project-local config
+declares a plugin with the same name as one in your user-global config, the
+user-global definition wins: the project-local duplicate is rejected (with a
+load error naming the config that already claimed the name) instead of
+shadowing it or running alongside it.
 
 When reqsmith finds a project-local `.reqsmith/plugins.toml`, it does **not**
 instantiate any WASM from it unless you explicitly opt in for that run:
@@ -61,13 +71,14 @@ either can't happen or would be silently skipped, so the opt-in is
 env-var-only and must be a deliberate, out-of-band decision each time you
 choose to trust a given project's plugins for that invocation.
 
-If a project-local config is found but you haven't opted in, reqsmith logs a
-single warning naming the file and how to enable it, then behaves exactly as
-if no plugin config had been found at all (an empty plugin registry — no
-plugin is loaded, no `.wasm` file is even read).
+If a project-local config is found but you haven't opted in, no `.wasm` file
+from it is even read. The refusal is visible, not just logged: `reqsmith plugin
+list` shows those entries with status `blocked_untrusted` and prints the
+variable to set, and `reqsmith plugin info <name>` says the same.
 
 **User-global plugins are unaffected by this gate** — they're the config you
-put on your own machine, not something a repository can plant.
+put on your own machine, not something a repository can plant — and they still
+load normally in a directory whose project-local config was refused.
 
 ## C2 — Pin plugin integrity with `sha256`
 
@@ -83,11 +94,17 @@ sha256 = "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
 ```
 
 Before instantiating the plugin, reqsmith computes the SHA-256 digest of the
-on-disk `.wasm` file and compares it (case-insensitively) against `sha256`.
-If they don't match, the plugin fails to load with a clear
-`IntegrityMismatch` error naming the plugin, the expected digest, and the
-digest actually found — and that plugin is not run. If `sha256` is omitted,
-behavior is unchanged from before (the file loads as-is).
+on-disk `.wasm` file and compares it against `sha256`. If they don't match,
+that plugin fails to load with an `IntegrityMismatch` error naming the plugin,
+the expected digest, and the digest actually found — and it is not run. If
+`sha256` is omitted, the file loads as-is.
+
+The digest is normalized before comparison: surrounding whitespace is trimmed,
+an optional `sha256:` prefix is stripped, and case is ignored. What remains
+must be exactly **64 hex characters** — anything else is rejected at config
+load as a *malformed sha256*, not silently treated as a mismatch, so a
+truncated or mistyped digest can't quietly turn into a load failure you'd
+misread as tampering.
 
 This protects against the WASM file being swapped (accidentally or
 maliciously) without the config being updated to match — e.g. a build
@@ -95,6 +112,19 @@ artifact getting overwritten, or a compromised dependency replacing the
 binary a `plugins.toml` on disk still points to.
 
 Compute a digest to pin with, e.g.: `shasum -a 256 plugins/auth.wasm`.
+
+## Where plugin modules may live
+
+A `[[plugin]]` `path` is resolved relative to the directory containing its
+`plugins.toml`, and the declared path must be relative and must not escape
+that directory. Absolute paths, home-relative (`~/…`) paths, and any path
+with a `..` component are rejected with a config error. If the resolved path
+exists, reqsmith additionally canonicalizes both it and the config directory
+and checks the real path still lives inside the real directory, so a symlink
+planted inside the config directory can't point the loader somewhere else on
+disk. This keeps a `plugins.toml` from reaching somewhere else on your
+filesystem for the bytes it runs, and keeps the file you review (the config)
+adjacent to the bytes it names.
 
 ## C3 — Env-var least privilege (`env_allowlist`)
 
@@ -127,17 +157,40 @@ which variables it needs.
 
 Two limits from `plugins.toml` bound what a loaded plugin can consume:
 
-- `timeout_ms` (default `5000`) — wall-clock timeout for a single plugin
-  call. A call that exceeds this returns `PluginError::Timeout` instead of
-  hanging the request pipeline.
-- `memory_limit_pages` (default `256`, i.e. 256 * 64KiB = 16MiB) — the
-  maximum WASM linear memory the plugin's instance may grow to.
+- `timeout_ms` (default `5000`, must be `1..=30000`) — wall-clock timeout for
+  a single plugin call. A call that exceeds this returns
+  `PluginError::Timeout` instead of hanging the request pipeline.
+- `memory_limit_pages` (default `256`, must be `1..=1024`; a page is 64KiB, so
+  the ceiling is 64MiB) — the maximum WASM linear memory the plugin's instance
+  may grow to.
+
+Both are validated at config load: `0` (which would mean "no guard at all") and
+values past the ceilings above are rejected with a config error naming the
+field and its bound, so a `plugins.toml` cannot quietly opt out of the limits
+that make the sandbox bounded.
 
 These are per-plugin, driven by the top-level `timeout_ms` /
 `memory_limit_pages` keys in `plugins.toml` (not currently configurable
-per-entry). There is no separate fuel/instruction-metering knob in use today
-— the wall-clock timeout is the guard against a plugin that spins instead of
-allocating.
+per-entry). No fuel/instruction budget is metered: the wall-clock timeout is
+the guard against a plugin that spins instead of allocating.
+
+## Per-entry failure isolation
+
+A plugin that fails to load takes only itself out. An unreadable module, a
+digest mismatch, a path that escapes the config directory, or a module Extism
+can't instantiate is recorded against that entry and skipped; every other
+plugin in both configs still loads. A module the config names but that isn't
+on disk is a skip rather than a failure.
+
+`reqsmith plugin list` shows the outcome per plugin (`loaded`, `missing_wasm`,
+`load_failed`, `blocked_untrusted`, `disabled`, `configured` — shown when the
+registry as a whole failed to build, so status can't be resolved further),
+and `reqsmith plugin info <name>` prints that entry's load error. This
+matters for security review: a tampered plugin's failure is reported next to
+the plugin that caused it, instead of silently disabling your whole plugin
+set. A `plugins.toml` that itself fails to read/parse/validate does not
+suppress the others: it's reported as its own warning, and every config that
+*did* parse is still shown (H1).
 
 ## The sandbox boundary
 
@@ -168,6 +221,20 @@ reqsmith applies back onto the request or response. Reviewing a plugin's source
 means checking what it does with those three things — not worrying about it
 reaching outside the sandbox, since it structurally cannot.
 
+### A `post_response` hook can defeat header redaction
+
+reqsmith redacts sensitive response headers **by name** (`set-cookie`,
+`authorization`, …) before printing, diffing, or storing a run snapshot. A
+`post_response` plugin runs *before* that and can rewrite the response it is
+handed — including renaming `set-cookie` to something the redaction policy
+doesn't recognize, which puts the secret's value into stdout and the stored
+snapshot in the clear.
+
+This is inherent to letting a plugin mutate a response at all; there is no fix
+short of not running the plugin. Treat `post_response` as a capability that
+can expose any secret the response carries, and grant it only to plugins you
+have reviewed.
+
 ## Summary checklist
 
 - Only run plugins whose source you've reviewed or whose publisher you
@@ -176,7 +243,15 @@ reaching outside the sandbox, since it structurally cannot.
 - Project-local plugins (`.reqsmith/plugins.toml` in a repo) are off by default;
   set `REQSMITH_ALLOW_PROJECT_PLUGINS=1` only for repositories you trust, and
   only for the invocation where you actually need them.
+- **Never export `REQSMITH_ALLOW_PROJECT_PLUGINS=1` from your shell profile**
+  (or a CI job's global env). It is per-invocation on purpose: a permanent
+  export silently opts in *every* repository you ever `cd` into, which is
+  exactly the supply-chain hole C1 exists to close. Prefix the one command
+  that needs it instead.
 - Pin `sha256` on plugin entries you care about, especially ones sourced
   from anywhere outside your own build.
 - Keep `env_allowlist` as small as each plugin actually needs — start from
-  empty and add names one at a time.
+  empty and add names one at a time. `reqsmith plugin info <name>` flags
+  allowlisted names that look sensitive, and loading warns about them.
+- Treat `post_response` as the most dangerous capability: it can rename
+  headers and so defeat name-based redaction of stdout and stored snapshots.

@@ -17,6 +17,10 @@ ignore = [
   # Only reachable with `--features plugins`. Patched in wasmtime >=46, but
   # extism 1.30 pins wasmtime 43; no compatible upgrade exists yet.
   "RUSTSEC-2026-0222",
+  # wasmtime filesystem sandbox escape via trailing slashes (HIGH, 8.8).
+  # Only reachable with `--features plugins`. Patched in wasmtime >=46.0.3, but
+  # extism 1.30 pins wasmtime 43; no compatible upgrade exists yet.
+  "RUSTSEC-2026-0269",
   # Unmaintained crates pulled in transitively ONLY by the wasmtime/extism
   # tree (plugins feature). No maintained replacement is selectable here.
   "RUSTSEC-2026-0247", # bitmaps unmaintained

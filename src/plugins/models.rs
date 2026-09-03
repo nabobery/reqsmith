@@ -315,6 +315,7 @@ mod tests {
             body_text: Some(r#"{"ok":true}"#.into()),
             body_bytes: None,
             is_binary: false,
+            truncated: false,
         };
 
         let ctx = ResponseContext::from_artifact(&artifact);
@@ -428,9 +429,10 @@ mod tests {
             content_type: Some("application/octet-stream".into()),
             content_length: Some(4),
             duration_ms: 50,
-            body_text: Some("[Binary response: 4 bytes. Press 'w' to save to disk.]".into()),
+            body_text: None,
             body_bytes: Some(vec![0, 1, 2, 3]),
             is_binary: true,
+            truncated: false,
         };
 
         let mutated = ResponseContext {

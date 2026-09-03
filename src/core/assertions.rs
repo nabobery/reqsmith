@@ -187,6 +187,7 @@ mod tests {
             body_text: body.map(String::from),
             body_bytes: None,
             is_binary: false,
+            truncated: false,
         }
     }
 

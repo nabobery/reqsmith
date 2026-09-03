@@ -9,17 +9,22 @@ want [getting-started.md](getting-started.md); contributors want
 - [ ] **Secret scan (history + tree).** CI runs this automatically on every
       push/PR via the `secrets` job (`gitleaks git` over full history +
       `gitleaks dir` over the working tree, version-pinned). To reproduce
-      locally: `gitleaks git --redact .` and `gitleaks dir --redact .`. Both
-      must report _no leaks_.
+      locally: `just secrets`, i.e. `gitleaks git --redact .` and
+      `gitleaks dir --redact .`. Both must report _no leaks_. The local `dir`
+      scan also walks `target/` (CI checks out fresh, so it has none); run
+      `cargo clean` first if it is slow.
 - [ ] **Dependency review.** `cargo audit` and `cargo deny --all-features check`
       must pass (`--all-features` so the plugin/extism graph the exceptions
       target is actually evaluated). The
       accepted no-fix exceptions are documented in [`../deny.toml`](../deny.toml)
       and beside the `cargo audit --ignore` flags in
-      `.github/workflows/checks.yml`. Cargo Audit additionally suppresses two
-      warning-class unsoundness advisories that Cargo Deny does not match as
-      deny findings. Re-check every exception on each dependency bump and drop
-      entries that become fixable.
+      `.github/workflows/checks.yml`. Cargo Audit additionally suppresses the
+      warning-class unmaintained/unsoundness advisories that Cargo Deny does
+      not match as deny findings. Every exception except `RUSTSEC-2026-0253`
+      (`lru`, reached from the default build via `ratatui`) is confined to the
+      optional `plugins` feature. Re-check every exception on each dependency
+      bump and drop entries that become fixable. Locally: `just audit` and
+      `just deny`.
 - [ ] **Feature-flag hygiene.** The default build holds MSRV 1.88. The optional
       `plugins` feature pulls in extism/wasmtime and requires Rust >= 1.91.
       Review every temporary exception in `deny.toml` rather than relying on a
@@ -36,7 +41,7 @@ want [getting-started.md](getting-started.md); contributors want
       `checks.yml` workflow, so on a PR the checks surface under the `checks`
       caller job): `checks / fmt`, `checks / clippy`,
       `checks / test (ubuntu-latest)`, `checks / test (macos-latest)`,
-      `checks / test (windows-latest)`, `checks / msrv (1.88)`,
+      `checks / test (windows-latest)`, `checks / msrv`,
       `checks / audit`, `checks / deny`, `checks / secrets`. (Pick the exact
       names from a first PR's checks list.)
 - [ ] Require branches to be up to date before merging.
@@ -65,10 +70,12 @@ want [getting-started.md](getting-started.md); contributors want
    tag placed on an unverified commit cannot publish. Build/SBOM depend on both.
    It then builds the five target binaries with `cargo auditable` (embedding the
    dependency list for later `cargo audit bin`), smoke-tests each native
-   binary, generates a CycloneDX SBOM, writes `SHA256SUMS`, attests build
-   provenance (`actions/attest-build-provenance`), and publishes a GitHub
-   Release with all assets attached. Only the final `release` job holds
-   `contents: write` (build/SBOM jobs run read-only).
+   binary, generates a CycloneDX SBOM, writes `SHA256SUMS` and re-verifies it
+   with `sha256sum -c`, attests build provenance
+   (`actions/attest-build-provenance`, covering the archives, `SHA256SUMS`, and
+   the SBOM), and publishes a GitHub Release with all assets attached. Only
+   the final `release` job holds `contents: write` (build/SBOM jobs run
+   read-only).
 4. Verify the release assets, checksums, and the provenance attestation before
    announcing.
 
@@ -86,19 +93,11 @@ advertised as `latest`. Prefer validating a prerelease before any `1.0.0`.
 
 ## crates.io
 
-`reqsmith` was verified free on the crates.io index, so publishing there is an
-option in addition to the GitHub Release binaries.
+`reqsmith` is free on the crates.io index and its `Cargo.toml` metadata is
+publish-ready. The full step-by-step runbook — first manual publish, then
+Trusted Publishing (OIDC, no stored token) for subsequent releases — lives in
+[`crates-io-release.md`](crates-io-release.md).
 
-Before the first `cargo publish`:
-
-- [ ] Reserve the name early (even a `0.1.0`) so it can't be taken; re-check the
-      index right before publishing in case it changed.
-- [ ] Confirm `Cargo.toml` has the metadata crates.io requires/recommends:
-      `description`, `license`, `repository`, `readme`, `keywords`,
-      `categories`.
-- [ ] `cargo publish --dry-run --locked` is clean.
-- [ ] The published crate builds default-features on the MSRV (1.88); the
-      `plugins` feature's higher floor (1.91) is documented in the README.
-
-Until then, `cargo install --git https://github.com/nabobery/reqsmith` and the
-GitHub Release binaries remain the install paths.
+Until the crate is published, `cargo install --git
+https://github.com/nabobery/reqsmith` and the GitHub Release binaries are the
+install paths.

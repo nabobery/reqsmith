@@ -4,3 +4,14 @@
 *~
 .DS_Store
 *.log
+
+# Release/packaging output
+/dist
+*.cdx.json
+
+# Local secrets and reqsmith working state (never commit real credentials)
+.env
+.env.*
+!.env.example
+reqsmith_envs.yml
+.reqsmith/

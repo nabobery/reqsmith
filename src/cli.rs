@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[cfg(feature = "plugins")]
 pub use plugin_cli::PluginAction;
@@ -28,35 +28,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Execute a saved request without launching the TUI
-    Run {
-        /// Path to .req.yml request file
-        file: PathBuf,
-
-        /// Named environment to use (from reqsmith_envs.yml or .env.<name>)
-        #[arg(short, long)]
-        env: Option<String>,
-
-        /// Override variables (key=value)
-        #[arg(long = "var", value_parser = parse_key_value)]
-        vars: Vec<(String, String)>,
-
-        /// Output format
-        #[arg(short, long, default_value = "human")]
-        output: OutputMode,
-
-        /// Suppress all output except errors
-        #[arg(short, long)]
-        quiet: bool,
-
-        /// Persist the run result to .reqsmith/runs/ for later diffing
-        #[arg(long)]
-        save: bool,
-
-        /// Reject requests to private/loopback hosts (basic SSRF guard).
-        /// Off by default so localhost/LAN targets keep working.
-        #[arg(long)]
-        deny_private_networks: bool,
-    },
+    Run(RunArgs),
 
     /// Format request files with canonical YAML ordering
     Fmt {
@@ -112,6 +84,39 @@ pub enum Command {
     },
 }
 
+/// Arguments for the `run` subcommand.
+#[derive(Args, Debug)]
+pub struct RunArgs {
+    /// Path to .req.yml request file
+    pub file: PathBuf,
+
+    /// Named environment to use (from reqsmith_envs.yml or .env.<name>)
+    #[arg(short, long)]
+    pub env: Option<String>,
+
+    /// Override variables (key=value)
+    #[arg(long = "var", value_parser = parse_key_value)]
+    pub vars: Vec<(String, String)>,
+
+    /// Output format
+    #[arg(short, long, default_value = "human")]
+    pub output: OutputMode,
+
+    /// Suppress all output except errors
+    #[arg(short, long)]
+    pub quiet: bool,
+
+    /// Persist the run result to .reqsmith/runs/ for later diffing
+    #[arg(long)]
+    pub save: bool,
+
+    /// Reject requests to private/loopback hosts (basic SSRF guard); off by default so localhost/LAN targets keep working.
+    ///
+    /// Can also be enabled with REQSMITH_DENY_PRIVATE_NETWORKS=1.
+    #[arg(long)]
+    pub deny_private_networks: bool,
+}
+
 #[cfg(feature = "plugins")]
 mod plugin_cli {
     use clap::Subcommand;
@@ -142,7 +147,11 @@ fn parse_key_value(s: &str) -> Result<(String, String), String> {
     let pos = s
         .find('=')
         .ok_or_else(|| format!("invalid KEY=VALUE: no `=` found in `{s}`"))?;
-    Ok((s[..pos].to_string(), s[pos + 1..].to_string()))
+    let key = &s[..pos];
+    if key.trim().is_empty() {
+        return Err(format!("invalid KEY=VALUE: empty key in `{s}`"));
+    }
+    Ok((key.to_string(), s[pos + 1..].to_string()))
 }
 
 #[cfg(test)]
@@ -186,22 +195,14 @@ mod tests {
             "--quiet",
         ]);
         match cli.command {
-            Some(Command::Run {
-                ref file,
-                ref env,
-                ref vars,
-                ref output,
-                quiet,
-                save,
-                deny_private_networks,
-            }) => {
-                assert_eq!(file, &PathBuf::from("requests/test.req.yml"));
-                assert_eq!(env.as_deref(), Some("staging"));
-                assert_eq!(vars, &[("token".to_string(), "abc123".to_string())]);
-                assert_eq!(output, &OutputMode::Json);
-                assert!(quiet);
-                assert!(!save);
-                assert!(!deny_private_networks);
+            Some(Command::Run(ref args)) => {
+                assert_eq!(args.file, PathBuf::from("requests/test.req.yml"));
+                assert_eq!(args.env.as_deref(), Some("staging"));
+                assert_eq!(args.vars, [("token".to_string(), "abc123".to_string())]);
+                assert_eq!(args.output, OutputMode::Json);
+                assert!(args.quiet);
+                assert!(!args.save);
+                assert!(!args.deny_private_networks);
             }
             _ => panic!("expected Run subcommand"),
         }
@@ -211,11 +212,9 @@ mod tests {
     fn run_subcommand_defaults() {
         let cli = Cli::parse_from(["reqsmith", "run", "test.req.yml"]);
         match cli.command {
-            Some(Command::Run {
-                ref output, quiet, ..
-            }) => {
-                assert_eq!(output, &OutputMode::Human);
-                assert!(!quiet);
+            Some(Command::Run(ref args)) => {
+                assert_eq!(args.output, OutputMode::Human);
+                assert!(!args.quiet);
             }
             _ => panic!("expected Run subcommand"),
         }
@@ -256,6 +255,21 @@ mod tests {
     }
 
     #[test]
+    fn deny_private_networks_flag_parses() {
+        let cli = Cli::parse_from(["reqsmith", "run", "test.req.yml", "--deny-private-networks"]);
+        match cli.command {
+            Some(Command::Run(ref args)) => assert!(args.deny_private_networks),
+            _ => panic!("expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn var_parsing_rejects_empty_key() {
+        let error = parse_key_value("=value").unwrap_err();
+        assert!(error.contains("empty key"), "got: {error}");
+    }
+
+    #[test]
     fn var_parsing_requires_equals() {
         let result = parse_key_value("no_equals");
         assert!(result.is_err());
@@ -280,10 +294,10 @@ mod tests {
             "b=2",
         ]);
         match cli.command {
-            Some(Command::Run { ref vars, .. }) => {
-                assert_eq!(vars.len(), 2);
-                assert_eq!(vars[0], ("a".to_string(), "1".to_string()));
-                assert_eq!(vars[1], ("b".to_string(), "2".to_string()));
+            Some(Command::Run(ref args)) => {
+                assert_eq!(args.vars.len(), 2);
+                assert_eq!(args.vars[0], ("a".to_string(), "1".to_string()));
+                assert_eq!(args.vars[1], ("b".to_string(), "2".to_string()));
             }
             _ => panic!("expected Run subcommand"),
         }

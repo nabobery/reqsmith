@@ -8,7 +8,6 @@ use super::models::{EnvironmentSet, VarSource};
 use crate::infra::env_loader;
 
 #[derive(Error, Debug)]
-#[allow(dead_code)] // Used in Step 4+.
 pub enum EnvironmentError {
     #[error("Named environment '{0}' not found in reqsmith_envs.yml")]
     NamedEnvNotFound(String),
@@ -22,7 +21,6 @@ pub enum EnvironmentError {
 
 /// Schema for `reqsmith_envs.yml`.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct ReqsmithEnvsFile {
     environments: BTreeMap<String, BTreeMap<String, String>>,
 }
@@ -35,7 +33,6 @@ struct ReqsmithEnvsFile {
 /// 3. `.env.<name>` file
 /// 4. `.env` file
 /// 5. OS environment (applied as fallback during interpolation, not here)
-#[allow(dead_code)] // Used in Step 4+.
 pub fn resolve_environment(
     cwd: &Path,
     env_name: Option<&str>,
@@ -82,7 +79,6 @@ pub fn resolve_environment(
 ///
 /// `required_vars` is the set of variable names referenced in the request template.
 /// For each that is missing from `env.values`, we check `std::env::var()`.
-#[allow(dead_code)] // Used in Step 4+.
 pub fn apply_os_env_fallback(env: &mut EnvironmentSet, required_vars: &[String]) {
     for var_name in required_vars {
         if !env.values.contains_key(var_name)

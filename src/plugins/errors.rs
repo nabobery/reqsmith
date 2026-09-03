@@ -1,6 +1,5 @@
 /// Plugin-specific error types.
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)]
 pub enum PluginError {
     #[error("Plugin '{name}' failed: {message}")]
     ExecutionFailed { name: String, message: String },
@@ -17,8 +16,8 @@ pub enum PluginError {
     #[error("Unsupported plugin API version {version} (supported: {supported})")]
     UnsupportedApiVersion { version: u32, supported: u32 },
 
-    #[error("Plugin '{name}' lacks required capability: {capability}")]
-    MissingCapability { name: String, capability: String },
+    #[error("Plugin host data unavailable: {0}")]
+    HostDataUnavailable(String),
 
     #[error("Plugin '{name}' failed integrity check: expected sha256 {expected}, got {actual}")]
     IntegrityMismatch {
@@ -60,11 +59,8 @@ mod tests {
         assert!(err.to_string().contains("bad"));
         assert!(err.to_string().contains("file not found"));
 
-        let err = PluginError::MissingCapability {
-            name: "my-plugin".into(),
-            capability: "pre_request".into(),
-        };
-        assert!(err.to_string().contains("pre_request"));
+        let err = PluginError::HostDataUnavailable("gone".into());
+        assert!(err.to_string().contains("gone"));
 
         let err = PluginError::IntegrityMismatch {
             name: "auth-plugin".into(),

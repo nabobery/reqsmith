@@ -22,8 +22,6 @@ struct FlatNode {
     kind: CollectionNodeKind,
     depth: usize,
     is_expanded: bool,
-    #[allow(dead_code)]
-    has_children: bool,
 }
 
 #[derive(Default)]
@@ -52,7 +50,6 @@ impl CollectionsPane {
             kind: node.kind.clone(),
             depth: node.depth,
             is_expanded,
-            has_children,
         });
 
         if is_expanded {
@@ -79,8 +76,8 @@ impl CollectionsPane {
         }
     }
 
-    #[allow(dead_code)]
     /// Returns true if the collection is empty (no files discovered).
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }

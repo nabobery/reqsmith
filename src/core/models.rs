@@ -8,7 +8,6 @@ use serde_json::Value as JsonValue;
 /// HTTP methods supported by reqsmith.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
-#[allow(dead_code)] // Variants used progressively across Phase 1 steps.
 pub enum HttpMethod {
     #[default]
     Get,
@@ -21,7 +20,6 @@ pub enum HttpMethod {
 }
 
 impl HttpMethod {
-    #[allow(dead_code)]
     pub const ALL: [HttpMethod; 7] = [
         HttpMethod::Get,
         HttpMethod::Post,
@@ -83,26 +81,8 @@ pub struct RequestDocument {
     pub file_path: Option<PathBuf>,
 }
 
-impl RequestDocument {
-    #[allow(dead_code)]
-    pub fn new_empty(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            method: HttpMethod::default(),
-            url: String::new(),
-            headers: Vec::new(),
-            params: Vec::new(),
-            body: None,
-            auth_plugin: None,
-            assertions: Vec::new(),
-            file_path: None,
-        }
-    }
-}
-
 /// Normalized response data from an executed HTTP request.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct ResponseArtifact {
     pub status_code: u16,
     pub http_version: String,
@@ -113,11 +93,12 @@ pub struct ResponseArtifact {
     pub body_text: Option<String>,
     pub body_bytes: Option<Vec<u8>>,
     pub is_binary: bool,
+    /// The body hit the read cap and is a prefix of what the server sent.
+    pub truncated: bool,
 }
 
 /// A node in the collection file tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct CollectionNode {
     pub name: String,
     pub path: PathBuf,
@@ -127,17 +108,13 @@ pub struct CollectionNode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum CollectionNodeKind {
     Directory,
     RequestFile,
 }
 
-// --- Phase 2: Environment, Validation, and Run Result models ---
-
 /// Tracks where a resolved variable came from (for diagnostics/debugging).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Used progressively across Phase 2 steps.
 pub enum VarSource {
     OsEnv,
     DotEnv,
@@ -164,7 +141,6 @@ impl fmt::Display for VarSource {
 
 /// A resolved environment with provenance tracking for each variable.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct EnvironmentSet {
     /// The merged variable map (final resolved values).
     pub values: HashMap<String, String>,
@@ -174,7 +150,6 @@ pub struct EnvironmentSet {
 
 /// Severity level for a validation diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum ValidationSeverity {
     Error,
     Warning,
@@ -182,7 +157,6 @@ pub enum ValidationSeverity {
 
 /// A single validation finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct ValidationDiagnostic {
     pub severity: ValidationSeverity,
     pub message: String,
@@ -196,7 +170,6 @@ pub struct ValidationReport {
     pub diagnostics: Vec<ValidationDiagnostic>,
 }
 
-#[allow(dead_code)]
 impl ValidationReport {
     pub fn has_errors(&self) -> bool {
         self.diagnostics
@@ -204,7 +177,7 @@ impl ValidationReport {
             .any(|d| d.severity == ValidationSeverity::Error)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn has_warnings(&self) -> bool {
         self.diagnostics
             .iter()
@@ -228,8 +201,7 @@ pub enum ExitCode {
     InternalError = 1,
     ValidationFailure = 2,
     NetworkFailure = 3,
-    #[allow(dead_code)]
-    AssertionFailure = 4, // Reserved for Phase 3
+    AssertionFailure = 4,
     Interrupted = 130,
 }
 
@@ -241,7 +213,6 @@ impl From<ExitCode> for std::process::ExitCode {
 
 /// Result of executing a request (used by both TUI and CLI).
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct RunResult {
     pub request_name: String,
     pub request_file: PathBuf,
@@ -252,11 +223,12 @@ pub struct RunResult {
     pub assertions: AssertionReport,
 }
 
-// --- Phase 3: Assertion, Diff, and StoredRun models ---
-
 /// A single assertion to evaluate against a response.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::enum_variant_names)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "each variant names the assertion key it deserializes from"
+)]
 pub enum Assertion {
     ExpectStatus(u16),
     ExpectTimeUnder(u64),
@@ -466,14 +438,9 @@ pub struct AssertionReport {
     pub results: Vec<AssertionResult>,
 }
 
-#[allow(dead_code)]
 impl AssertionReport {
     pub fn all_passed(&self) -> bool {
         self.results.iter().all(|r| r.passed)
-    }
-
-    pub fn failures(&self) -> Vec<&AssertionResult> {
-        self.results.iter().filter(|r| !r.passed).collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -491,7 +458,6 @@ impl AssertionReport {
 
 /// A serializable snapshot of a completed run, for diffing and history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct StoredRun {
     pub request_name: String,
     pub request_file: PathBuf,
@@ -501,10 +467,11 @@ pub struct StoredRun {
     pub headers: Vec<(String, String)>,
     pub content_type: Option<String>,
     pub body_text: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
     pub assertions: Vec<AssertionResult>,
 }
 
-#[allow(dead_code)]
 impl StoredRun {
     pub fn from_run_result(result: &RunResult) -> Option<Self> {
         let response = result.response.as_ref()?;
@@ -517,6 +484,7 @@ impl StoredRun {
             headers: response.headers.clone(),
             content_type: response.content_type.clone(),
             body_text: response.body_text.clone(),
+            truncated: response.truncated,
             assertions: result.assertions.results.clone(),
         })
     }
@@ -532,11 +500,11 @@ impl StoredRun {
             body_text: self.body_text.clone(),
             body_bytes: None,
             is_binary: false,
+            truncated: self.truncated,
         }
     }
 }
 
-#[allow(dead_code)]
 fn chrono_like_timestamp() -> String {
     use std::time::SystemTime;
     let now = SystemTime::now()
@@ -547,7 +515,6 @@ fn chrono_like_timestamp() -> String {
 
 /// Representation of a diff between two responses.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct DiffArtifact {
     pub baseline_label: String,
     pub candidate_label: String,
@@ -557,7 +524,6 @@ pub struct DiffArtifact {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum HeaderDiff {
     Added(String, String),
     Removed(String, String),
@@ -568,12 +534,48 @@ pub enum HeaderDiff {
     },
 }
 
+impl HeaderDiff {
+    /// The one-character marker every renderer uses for this kind of change.
+    pub fn sigil(&self) -> char {
+        match self {
+            HeaderDiff::Added(..) => '+',
+            HeaderDiff::Removed(..) => '-',
+            HeaderDiff::Changed { .. } => '~',
+        }
+    }
+
+    /// The header name and the value text to show after it, so the CLI and the
+    /// TUI cannot drift apart on how a change is spelled.
+    pub fn display_parts(&self) -> (&str, String) {
+        match self {
+            HeaderDiff::Added(key, value) | HeaderDiff::Removed(key, value) => (key, value.clone()),
+            HeaderDiff::Changed { key, old, new } => (key, format!("{old} -> {new}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum DiffLine {
     Equal(String),
     Insert(String),
     Delete(String),
+}
+
+impl DiffLine {
+    /// The one-character marker every renderer prefixes this line with.
+    pub fn sigil(&self) -> char {
+        match self {
+            DiffLine::Equal(_) => ' ',
+            DiffLine::Insert(_) => '+',
+            DiffLine::Delete(_) => '-',
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        match self {
+            DiffLine::Equal(s) | DiffLine::Insert(s) | DiffLine::Delete(s) => s,
+        }
+    }
 }
 
 #[cfg(test)]

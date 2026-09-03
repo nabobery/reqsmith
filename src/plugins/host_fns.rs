@@ -1,6 +1,17 @@
 use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use extism::{CurrentPlugin, Error, Function, UserData, Val, ValType};
+
+use super::errors::PluginError;
+
+/// Lock host data, recovering from a mutex poisoned by an earlier panicking
+/// host call rather than panicking again on the runtime thread. Release
+/// builds use `panic = "abort"`, so this recovery path only ever matters in
+/// debug/test builds, where a panic unwinds instead of aborting.
+fn lock_host_data(data: &Mutex<HostData>) -> MutexGuard<'_, HostData> {
+    data.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Data made available to host functions called from plugins.
 #[derive(Debug, Clone)]
@@ -49,10 +60,14 @@ impl HostContext {
         ]
     }
 
-    pub fn set_env_values(&self, env_values: HashMap<String, String>) {
-        if let Ok(mut data) = self.data.get().expect("host data should exist").lock() {
-            data.env_values = env_values;
-        }
+    /// Replace the env values visible to this plugin's `provide_env_var`.
+    pub fn set_env_values(&self, env_values: HashMap<String, String>) -> Result<(), PluginError> {
+        let data = self
+            .data
+            .get()
+            .map_err(|e| PluginError::HostDataUnavailable(e.to_string()))?;
+        lock_host_data(&data).env_values = env_values;
+        Ok(())
     }
 }
 
@@ -64,10 +79,8 @@ fn provide_env_var(
     data: UserData<HostData>,
 ) -> Result<(), Error> {
     let key: String = plugin.memory_get_val(&inputs[0])?;
-    let value = data
-        .get()?
-        .lock()
-        .unwrap()
+    let shared = data.get()?;
+    let value = lock_host_data(&shared)
         .env_values
         .get(&key)
         .cloned()
@@ -99,10 +112,8 @@ fn read_config(
     data: UserData<HostData>,
 ) -> Result<(), Error> {
     let key: String = plugin.memory_get_val(&inputs[0])?;
-    let value = data
-        .get()?
-        .lock()
-        .unwrap()
+    let shared = data.get()?;
+    let value = lock_host_data(&shared)
         .plugin_config
         .get(&key)
         .cloned()
@@ -124,10 +135,12 @@ mod tests {
             plugin_config: HashMap::from([("region".into(), "us-east-1".into())]),
         });
 
-        host_context.set_env_values(HashMap::from([("API_TOKEN".into(), "secret".into())]));
+        host_context
+            .set_env_values(HashMap::from([("API_TOKEN".into(), "secret".into())]))
+            .unwrap();
 
-        let shared = host_context.data.get().expect("host data should exist");
-        let data = shared.lock().unwrap();
+        let shared = host_context.data.get().unwrap();
+        let data = super::lock_host_data(&shared);
         assert_eq!(
             data.env_values.get("API_TOKEN").map(String::as_str),
             Some("secret")

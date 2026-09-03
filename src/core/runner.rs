@@ -10,7 +10,6 @@ use super::models::{AssertionReport, ExitCode, RequestDocument, RunResult};
 use super::validation::validate_document;
 
 /// Options controlling how a request is run.
-#[allow(dead_code)] // Used in Step 8.
 pub struct RunOptions {
     pub env_name: Option<String>,
     pub cli_vars: Vec<(String, String)>,
@@ -26,7 +25,12 @@ pub struct RunOptions {
 /// Run a request through the shared execution pipeline.
 ///
 /// Used by both TUI and CLI to ensure identical behavior.
-#[allow(dead_code)] // Used in Step 8 + Step 10.
+///
+/// `client` must be built with
+/// `infra::http_client::build_client(options.deny_private_networks)`: the
+/// redirect-hop half of the private-network guard lives in the client's
+/// redirect policy, not in this function, so a mismatched client silently
+/// loses that half of the guard.
 pub async fn run_request(
     client: &reqwest::Client,
     doc: &RequestDocument,
@@ -230,7 +234,6 @@ pub async fn run_request(
         };
     }
 
-    // 4. Execute.
     let exec_options = ExecutionOptions {
         deny_private_networks: options.deny_private_networks,
     };
@@ -244,7 +247,7 @@ pub async fn run_request(
     .await
     {
         Ok(artifact) => {
-            // 4.5. Post-response inspection hook.
+            // Post-response inspection hook.
             #[cfg(feature = "plugins")]
             let artifact = if let Some(registry) = &options.plugin_registry {
                 let resp_ctx = crate::plugins::models::ResponseContext::from_artifact(&artifact);
@@ -527,7 +530,9 @@ mod tests {
             plugin_registry: None,
         };
 
-        let client = reqwest::Client::new();
+        // Per the contract documented on `run_request`: the client must be
+        // built with the same `deny_private_networks` flag.
+        let client = crate::infra::http_client::build_client(true).unwrap();
         let result = run_request(&client, &doc, &options, CancellationToken::new()).await;
         // Blocked by policy before connecting -> validation-class failure, not
         // a network error (which is what the same URL yields without the flag).

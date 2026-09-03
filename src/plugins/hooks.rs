@@ -293,7 +293,8 @@ mod tests {
     #[tokio::test]
     async fn run_pre_request_with_empty_registry_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
-        let registry = PluginRegistry::discover_and_load(tmp.path()).unwrap();
+        // avoid discover_and_load(), which reads the real config dir/env var.
+        let registry = PluginRegistry::discover_and_load_with(tmp.path(), None, false);
         let ctx = HookContext {
             method: "GET".into(),
             url: "https://example.com".into(),
@@ -310,7 +311,8 @@ mod tests {
     #[tokio::test]
     async fn run_post_response_with_empty_registry_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
-        let registry = PluginRegistry::discover_and_load(tmp.path()).unwrap();
+        // avoid discover_and_load(), which reads the real config dir/env var.
+        let registry = PluginRegistry::discover_and_load_with(tmp.path(), None, false);
         let ctx = ResponseContext {
             status_code: 200,
             headers: vec![],
@@ -326,7 +328,8 @@ mod tests {
     #[tokio::test]
     async fn run_authenticate_with_empty_registry_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
-        let registry = PluginRegistry::discover_and_load(tmp.path()).unwrap();
+        // avoid discover_and_load(), which reads the real config dir/env var.
+        let registry = PluginRegistry::discover_and_load_with(tmp.path(), None, false);
         let req = AuthRequest {
             auth_type: "bearer".into(),
             config: Default::default(),
@@ -345,7 +348,8 @@ mod tests {
     #[tokio::test]
     async fn provide_variable_with_empty_registry_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
-        let registry = PluginRegistry::discover_and_load(tmp.path()).unwrap();
+        // avoid discover_and_load(), which reads the real config dir/env var.
+        let registry = PluginRegistry::discover_and_load_with(tmp.path(), None, false);
         assert!(
             provide_variable(&registry, "API_KEY", &HashMap::new())
                 .await

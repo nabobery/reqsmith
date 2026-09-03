@@ -13,6 +13,7 @@ use crate::components::request_editor::RequestEditorPane;
 use crate::components::response_viewer::ResponseViewerPane;
 use crate::components::status_bar::{self, StatusBarState};
 use crate::config::Config;
+use crate::core::execution;
 use crate::core::models::ResponseArtifact;
 use crate::core::repository;
 use crate::core::runner::{self, RunOptions};
@@ -41,6 +42,9 @@ pub struct App {
     // Response history for diffing
     previous_response: Option<ResponseArtifact>,
 
+    // Network policy (enabled via REQSMITH_DENY_PRIVATE_NETWORKS)
+    deny_private_networks: bool,
+
     // Status
     status_message: Option<String>,
     status_message_ticks: u32,
@@ -61,22 +65,32 @@ impl App {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
 
         let cwd = std::env::current_dir().unwrap_or_default();
-        let http_client = http_client::build_client()
+        let deny_private_networks = execution::deny_private_networks_from_env();
+        let http_client = http_client::build_client(deny_private_networks)
             .map_err(|e| color_eyre::eyre::eyre!("Failed to build HTTP client: {e}"))?;
 
         #[cfg(feature = "plugins")]
-        let plugin_registry =
-            match crate::plugins::registry::PluginRegistry::discover_and_load(&cwd) {
-                Ok(r) if !r.is_empty() => {
-                    tracing::info!("Loaded {} plugin(s)", r.len());
-                    Some(std::sync::Arc::new(r))
-                }
-                Ok(_) => None,
-                Err(e) => {
-                    tracing::warn!("Plugin loading failed: {e}");
-                    None
-                }
+        let (plugin_registry, status_message) = {
+            let registry = crate::plugins::registry::PluginRegistry::discover_and_load(&cwd);
+            let warnings = crate::commands::run::plugin_warnings(
+                registry.blocked_project_config(),
+                registry.config_errors(),
+                registry.load_errors(),
+            );
+            for warning in &warnings {
+                tracing::warn!("{warning}");
+            }
+            let status = plugin_status_message(&warnings);
+            let registry = if registry.is_empty() {
+                None
+            } else {
+                tracing::info!("Loaded {} plugin(s)", registry.len());
+                Some(std::sync::Arc::new(registry))
             };
+            (registry, status)
+        };
+        #[cfg(not(feature = "plugins"))]
+        let status_message = None;
 
         Ok(Self {
             config,
@@ -91,8 +105,9 @@ impl App {
             cancel_token: None,
             cwd,
             request_in_flight: false,
+            deny_private_networks,
             previous_response: None,
-            status_message: None,
+            status_message,
             status_message_ticks: 0,
             #[cfg(feature = "plugins")]
             plugin_registry,
@@ -313,9 +328,9 @@ impl App {
                         validate_before_run: false,
                         cwd: self.cwd.clone(),
                         // The interactive TUI is a local-first client; keep
-                        // localhost/LAN targets working (the CLI `run
-                        // --deny-private-networks` flag is the opt-in path).
-                        deny_private_networks: false,
+                        // localhost/LAN targets working unless the operator
+                        // opted in via REQSMITH_DENY_PRIVATE_NETWORKS.
+                        deny_private_networks: self.deny_private_networks,
                         #[cfg(feature = "plugins")]
                         plugin_registry: self.plugin_registry.clone(),
                     };
@@ -344,9 +359,10 @@ impl App {
                 self.request_in_flight = false;
                 self.cancel_token = None;
                 let duration = artifact.duration_ms;
-                // Save current response as previous for diffing
-                let prev = self.response_viewer.take_response();
-                self.previous_response = prev;
+                // Save current response as previous for diffing. Cloned because
+                // `previous_response` must outlive the borrow of
+                // `response_viewer` below (it's passed back into it).
+                self.previous_response = self.response_viewer.current_response().cloned();
                 self.response_viewer.set_response_with_diff(
                     *artifact,
                     *assertions,
@@ -491,6 +507,11 @@ impl App {
     }
 }
 
+#[cfg(feature = "plugins")]
+fn plugin_status_message(warnings: &[String]) -> Option<String> {
+    (!warnings.is_empty()).then(|| warnings.join(" | "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,6 +650,7 @@ mod tests {
             body_text: Some("ok".into()),
             body_bytes: None,
             is_binary: false,
+            truncated: false,
         };
 
         app.update(Action::RequestCompleted(
@@ -670,5 +692,19 @@ mod tests {
             app.update(Action::Tick);
         }
         assert!(app.status_message.is_none());
+    }
+
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn plugin_warnings_become_the_initial_status_message() {
+        let warnings = vec![
+            "Warning: skipped project plugin config /project/plugins.toml".to_string(),
+            "Warning: plugin 'broken' failed to load".to_string(),
+        ];
+
+        let status = plugin_status_message(&warnings).unwrap();
+        assert!(status.contains("skipped project plugin config"));
+        assert!(status.contains("broken"));
+        assert!(plugin_status_message(&[]).is_none());
     }
 }

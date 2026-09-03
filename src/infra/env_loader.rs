@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-#[allow(dead_code)] // Used in Step 5.
 /// Load environment variables from a `.env` file in the given directory.
 ///
 /// Returns an empty map if the file does not exist. Errors from parsing
@@ -32,7 +31,6 @@ pub fn load_env(cwd: &Path) -> HashMap<String, String> {
 /// Load environment variables from a `.env.<name>` file in the given directory.
 ///
 /// Returns an empty map if the file does not exist.
-#[allow(dead_code)] // Used by environment module in Step 3+.
 pub fn load_named_env(cwd: &Path, name: &str) -> HashMap<String, String> {
     let env_path = cwd.join(format!(".env.{name}"));
     if !env_path.exists() {

@@ -5,7 +5,6 @@ mod commands;
 mod components;
 mod config;
 mod core;
-mod errors;
 mod infra;
 mod logging;
 mod output;
@@ -85,18 +84,7 @@ async fn run_tui(tick_rate: Option<u64>, frame_rate: Option<u64>) -> ExitCode {
 
 async fn run_command(cmd: cli::Command) -> ExitCode {
     match cmd {
-        cli::Command::Run {
-            file,
-            env,
-            vars,
-            output,
-            quiet,
-            save,
-            deny_private_networks,
-        } => {
-            commands::run::execute(file, env, vars, output, quiet, save, deny_private_networks)
-                .await
-        }
+        cli::Command::Run(args) => commands::run::execute(args).await,
 
         cli::Command::Fmt { files, check } => commands::fmt::execute(files, check),
 

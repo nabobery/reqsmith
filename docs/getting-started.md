@@ -28,6 +28,26 @@ reqsmith --version
 reqsmith --help
 ```
 
+### Install from a release
+
+Each tagged release attaches prebuilt archives named
+`reqsmith-<tag>-<target>.tar.gz` (Linux/macOS) or `reqsmith-<tag>-<target>.zip`
+(Windows), for the targets `x86_64-unknown-linux-gnu`,
+`x86_64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, and
+`x86_64-pc-windows-msvc`. Download the archive plus `SHA256SUMS` from
+<https://github.com/nabobery/reqsmith/releases>, then verify both the checksum
+and the build provenance before extracting:
+
+```bash
+sha256sum --ignore-missing -c SHA256SUMS
+gh attestation verify reqsmith-<tag>-<target>.tar.gz --repo nabobery/reqsmith
+tar -xzf reqsmith-<tag>-<target>.tar.gz
+```
+
+`sha256sum -c` proves the file matches what the release published;
+`gh attestation verify` (GitHub CLI) proves it was built by this repository's
+release workflow. On macOS, `shasum -a 256 -c` replaces `sha256sum -c`.
+
 ## 2. Write your first request
 
 reqsmith requests are plain YAML files ending in `.req.yml` (or `.req.yaml`).
@@ -107,6 +127,22 @@ Assertions: 1 passed, 0 failed
   PASS  expect_status: 200 (actual: 200)
 ```
 
+For machine-readable output (CI, scripting), pass `--output json` (or `-o json`):
+
+```bash
+reqsmith run get_users.req.yml --output json
+```
+
+This prints one JSON object with `request_name`, `request_file`, `exit_code`,
+`cancelled`, `error`, a `response` object (`status_code`, `http_version`,
+`duration_ms`, `content_type`, `content_length`, `headers`, `body`,
+`truncated`, `is_binary`), and — when the request has assertions — an
+`assertions` array. `truncated` is `true` if the body was cut off before
+being captured (see the body cap in
+[`docs/security-model.md`](security-model.md)); `is_binary` is `true` if the
+body looked like binary data rather than text, in which case `body` is
+`null` instead of the response text.
+
 For multiple named environments (dev/staging/prod), add `reqsmith_envs.yml`:
 
 Named environments live under a top-level `environments:` key:
@@ -135,6 +171,14 @@ reqsmith run get_users.req.yml --env staging
 ```bash
 reqsmith run get_users.req.yml --env staging --var base_url=http://127.0.0.1:8765
 ```
+
+Interpolation is single-pass: reqsmith scans a template once, so if a
+resolved variable's value itself contains `{{something}}`, that text is left
+alone rather than being expanded again. There's also no escape sequence for a
+literal `{{` — a `{{name}}` that isn't a defined variable is reported as an
+unresolved variable (and fails the run) rather than passing through as
+literal text, so avoid that exact pattern in URLs, headers, params, or bodies
+unless you mean it as a placeholder.
 
 ### Launching the TUI instead
 
@@ -185,14 +229,16 @@ redacted before they're written — see [Security](#security-notes) below):
 
 ```bash
 reqsmith run get_users.req.yml --save
-# Run saved to .reqsmith/runs/Get_Users_<timestamp>.json
+# Run saved to /home/you/my-api-project/.reqsmith/runs/Get_Users_<timestamp>.json
 ```
 
-Run it again later (e.g. after a deploy) and compare the two snapshots:
+The path is printed absolute (reqsmith resolves the save directory from the
+current working directory), but you can pass the snapshots to `diff` by
+relative path. Run it again later (e.g. after a deploy) and compare the two:
 
 ```bash
 reqsmith run get_users.req.yml --save
-# Run saved to .reqsmith/runs/Get_Users_<timestamp2>.json
+# Run saved to /home/you/my-api-project/.reqsmith/runs/Get_Users_<timestamp2>.json
 
 reqsmith diff .reqsmith/runs/Get_Users_<timestamp>.json .reqsmith/runs/Get_Users_<timestamp2>.json
 ```
@@ -212,7 +258,9 @@ kill "$FIXTURE_PID"
 
 - **Response headers are redacted** before they're printed, diffed, or
   saved: `Authorization`, `Set-Cookie`, `Cookie`, `X-Api-Key`, and a few
-  other sensitive header names are replaced with `<redacted>` by default.
+  other sensitive header names are replaced with a placeholder like
+  `<redacted:sha256:1a2b3c4d>` by default (the hex suffix is the start of the
+  real value's SHA-256 digest, so a rotated secret still diffs as changed).
   Extend the list with `REQSMITH_REDACT_HEADERS=x-my-secret,x-other-secret`.
   This is intentionally based on response-header names. Request files and
   response bodies are not rewritten, so do not hardcode credentials or save
