@@ -56,7 +56,7 @@ Already present and correct — confirm it still is before a release:
 ```toml
 [package]
 name = "reqsmith"
-version = "0.1.0"          # bump per release; must match the git tag
+version = "0.1.0"          # exact release version; tag must be v<version>
 edition = "2024"
 rust-version = "1.88"      # default-build MSRV (plugins feature needs 1.91)
 description = "Terminal-native API client — …"
@@ -66,8 +66,13 @@ readme = "README.md"
 keywords = ["http", "api-client", "tui", "cli", "rest"]   # ≤5, each ≤20 chars
 categories = ["command-line-utilities", "development-tools", "web-programming"]
 # Allowlist: only what a consumer of the published crate needs.
-include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE*", "CHANGELOG.md"]
+include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE*", "/CHANGELOG.md"]
 ```
+
+The `version` field is the release source of truth. The release workflow
+requires the pushed tag to be exactly `v` plus that value: `version =
+"0.1.0"` requires `v0.1.0`, while `version = "0.1.0-rc.1"` requires
+`v0.1.0-rc.1`.
 
 Optional polish:
 
@@ -105,10 +110,14 @@ e.g. `license = "MIT OR Apache-2.0"`.
 
 Run these from a clean checkout of the exact commit you intend to release:
 
-- [ ] Bump `version` in `Cargo.toml`.
-- [ ] `cargo build --locked` so `Cargo.lock` updates; commit both.
-- [ ] Move `CHANGELOG.md` `Unreleased` items under a `## [x.y.z] - <date>`
-      heading.
+- [ ] Set `version` in `Cargo.toml` to the exact version being released; the
+      tag must be `v` plus that value.
+- [ ] Run `cargo build` when dependency resolution or the manifest version
+      changes, review `Cargo.lock`, commit both files, then run
+      `cargo build --locked` to verify the committed lockfile.
+- [ ] Move the release notes under a dated `CHANGELOG.md` heading matching the
+      manifest version (for the first release, change `## [0.1.0] - unreleased`
+      to `## [0.1.0] - <date>`).
 - [ ] Re-check the name is still free (first release only):
       `curl -sI https://index.crates.io/re/qs/reqsmith` → `404` = free.
 - [ ] `cargo publish --dry-run --locked` is clean.

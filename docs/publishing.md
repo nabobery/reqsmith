@@ -58,25 +58,36 @@ want [getting-started.md](getting-started.md); contributors want
 
 ## Cutting a release
 
-1. Update [`../CHANGELOG.md`](../CHANGELOG.md): move `Unreleased` items under a
-   new `## [x.y.z] - <date>` heading.
-2. Bump `version` in `Cargo.toml`; run `cargo build --locked` so `Cargo.lock`
-   updates; commit.
-3. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`. The `Release`
-   workflow first runs a `guard` job that refuses to proceed unless the run was
-   triggered by a tag **and** the tag matches `version` in `Cargo.toml`, plus a
-   `verify` job that runs the **same reusable `checks.yml` gate as CI**
-   (fmt/clippy/tests/MSRV/audit/deny/secret-scan) on the tagged commit — so a
-   tag placed on an unverified commit cannot publish. Build/SBOM depend on both.
-   It then builds the five target binaries with `cargo auditable` (embedding the
-   dependency list for later `cargo audit bin`), smoke-tests each native
-   binary, generates a CycloneDX SBOM, writes `SHA256SUMS` and re-verifies it
-   with `sha256sum -c`, attests build provenance
-   (`actions/attest-build-provenance`, covering the archives, `SHA256SUMS`, and
-   the SBOM), and publishes a GitHub Release with all assets attached. Only
-   the final `release` job holds `contents: write` (build/SBOM jobs run
-   read-only).
-4. Verify the release assets, checksums, and the provenance attestation before
+1. Treat the `version` in `Cargo.toml` as the release version source of truth.
+   Set it to the exact version you intend to publish, including any prerelease
+   identifier. If dependency resolution or the manifest version changes, run
+   `cargo build`, review and commit `Cargo.lock`, then run
+   `cargo build --locked` to verify the committed lockfile.
+2. Update [`../CHANGELOG.md`](../CHANGELOG.md): move the release notes under a
+   dated heading that matches the manifest version. For the first release,
+   change `## [0.1.0] - unreleased` to `## [0.1.0] - <date>`.
+3. Create a tag whose name is exactly `v` plus the manifest version, then push
+   it. For example:
+
+   ```bash
+   git tag -a v0.1.0 -m "Release v0.1.0"
+   git push origin v0.1.0
+   ```
+
+   The `Release` workflow's `guard` job refuses to proceed unless the run was
+   triggered by a tag and the tag version exactly matches `Cargo.toml`. This
+   rule also applies to prereleases: `version = "0.1.0-rc.1"` requires the
+   tag `v0.1.0-rc.1`.
+4. The workflow runs the **same reusable `checks.yml` gate as CI**
+   (fmt/clippy/tests/MSRV/audit/deny/secret-scan) on the tagged commit. Build
+   and SBOM jobs depend on that gate. It then builds the five target binaries
+   with `cargo auditable`, smoke-tests each native binary, generates a CycloneDX
+   SBOM, writes `SHA256SUMS` and re-verifies it with `sha256sum -c`, attests
+   build provenance (`actions/attest-build-provenance`, covering the archives,
+   `SHA256SUMS`, and the SBOM), and publishes a GitHub Release with all assets
+   attached. Only the final `release` job holds `contents: write` (build/SBOM
+   jobs run read-only).
+5. Verify the release assets, checksums, and the provenance attestation before
    announcing.
 
 > **Protected release environment (one-time repo setup).** The `release` job
@@ -87,9 +98,23 @@ want [getting-started.md](getting-started.md); contributors want
 
 ### Prereleases
 
-Tag as `vX.Y.Z-rc.N`. The release workflow matches `v*.*.*`; mark the resulting
-GitHub Release as a pre-release in the UI (or adjust the workflow) so it is not
-advertised as `latest`. Prefer validating a prerelease before any `1.0.0`.
+Prerelease tags follow the same exact-match rule as regular releases. Set the
+manifest version first, then use the matching tag; for example:
+
+```toml
+version = "0.1.0-rc.1"
+```
+
+```bash
+git tag -a v0.1.0-rc.1 -m "Release v0.1.0-rc.1"
+git push origin v0.1.0-rc.1
+```
+
+The workflow creates a normal GitHub Release by default. Mark it as a
+pre-release in the GitHub UI before announcing it, or update
+`.github/workflows/release.yml` to pass `prerelease: true` to
+`softprops/action-gh-release`. Do not publish a prerelease until the intended
+crates.io versioning and Trusted Publishing policy has been confirmed.
 
 ## crates.io
 
