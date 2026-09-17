@@ -144,12 +144,27 @@ fn resolve_wasm_path_rejects_paths_escaping_the_config_directory() {
         ConfigSource::ProjectLocal,
     );
 
-    for bad in ["/etc/evil.wasm", "../../evil.wasm", "~/evil.wasm"] {
-        let err =
-            resolve_wasm_path(&discovered, Path::new("/tmp/project"), Path::new(bad)).unwrap_err();
+    let bad_paths = vec![
+        std::env::temp_dir().join("evil.wasm"),
+        PathBuf::from("../../evil.wasm"),
+        PathBuf::from("~/evil.wasm"),
+    ];
+    #[cfg(windows)]
+    let bad_paths = {
+        let mut bad_paths = bad_paths;
+        bad_paths.extend([
+            PathBuf::from(r"\etc\evil.wasm"),
+            PathBuf::from(r"C:\etc\evil.wasm"),
+            PathBuf::from(r"C:evil.wasm"),
+        ]);
+        bad_paths
+    };
+
+    for bad in bad_paths {
+        let err = resolve_wasm_path(&discovered, Path::new("/tmp/project"), &bad).unwrap_err();
         assert!(
             err.to_string().contains("must live under"),
-            "unexpected message for {bad}: {err}"
+            "unexpected message for {bad:?}: {err}"
         );
     }
 }

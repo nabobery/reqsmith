@@ -490,8 +490,16 @@ pub(crate) fn resolve_wasm_path(
         )))
     };
 
-    if path.is_absolute() {
-        return reject("is absolute");
+    // On Windows, a rooted path such as `\\etc\\evil.wasm` has a root but no
+    // drive prefix, so `is_absolute()` is false even though joining it can
+    // discard the config directory. Reject roots and prefixes explicitly,
+    // including drive-relative paths such as `C:evil.wasm`.
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+    {
+        return reject("is absolute or rooted");
     }
     if path.to_str().is_some_and(|v| v.starts_with("~/")) {
         return reject("is home-relative");
