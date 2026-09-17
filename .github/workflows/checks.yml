@@ -1,0 +1,161 @@
+name: checks
+
+# Reusable set of quality/security gates. Called by both `ci.yml` (on every
+# push/PR) and `release.yml` (before any artifact is built or published), so a
+# tagged release runs the *exact same* checks as a PR — no CI/release drift.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# Third-party actions are pinned to a full commit SHA (supply-chain hardening);
+# the trailing comment records the human-readable version. dtolnay/rust-toolchain
+# publishes no version tags, so it is pinned to its `stable` branch head and the
+# desired toolchain is passed explicitly via the `toolchain:` input.
+# taiki-e/install-action is pinned to v2.86.1 with the tool named via `tool:`
+# instead of the `@<tool>` ref shortcut. Dependabot (see
+# .github/dependabot.yml) proposes SHA bumps for the tag-versioned actions.
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - name: Test (default features)
+        run: cargo test --locked
+      - name: Test (all features)
+        run: cargo test --locked --all-features
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      # MSRV applies to the DEFAULT build only. The optional `plugins` feature
+      # pulls in extism/wasmtime which requires a newer Rust, so it is not built
+      # here on purpose (no --all-features).
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - name: Check (MSRV, default features)
+        run: cargo check --locked --all-targets
+
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2.86.1
+        with:
+          tool: cargo-audit
+      - name: cargo audit
+        # cargo audit scans Cargo.lock, which records the full dependency graph
+        # (optional deps included), so this already covers the plugin/extism
+        # crates. Each ignored advisory has no fix reachable from this graph;
+        # five also appear in deny.toml. The unsoundness advisories are
+        # cargo-audit-only because cargo-deny does not match them as deny
+        # findings. All exceptions except RUSTSEC-2026-0253 are confined to the
+        # optional `plugins` feature; revisit each one on every dependency bump.
+        run: >
+          cargo audit
+          --ignore RUSTSEC-2026-0222
+          --ignore RUSTSEC-2026-0269
+          --ignore RUSTSEC-2026-0247
+          --ignore RUSTSEC-2026-0250
+          --ignore RUSTSEC-2026-0251
+          --ignore RUSTSEC-2026-0255
+          --ignore RUSTSEC-2026-0253
+
+  deny:
+    name: deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2.86.1
+        with:
+          tool: cargo-deny
+      # --all-features so the feature-resolved graph includes the optional
+      # extism/wasmtime plugin dependencies. Several deny.toml [advisories].ignore
+      # and [bans] entries exist specifically for that graph; without
+      # --all-features cargo-deny never sees those crates and the exceptions
+      # would silently go unmatched.
+      - name: cargo deny (all features)
+        run: cargo deny --all-features check
+
+  secrets:
+    name: secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Full history so the scan covers every commit, not just the tip.
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          fetch-depth: 0
+      # Install gitleaks straight from its GitHub release, pinned by version and
+      # verified by SHA-256. We deliberately do NOT use taiki-e/install-action
+      # here: its bundled tool manifest doesn't track this gitleaks version and
+      # silently falls back to cargo-binstall, which then fails trying to find a
+      # (nonexistent) `gitleaks` crate. A pinned download + checksum check is
+      # deterministic and equally supply-chain-sound. No GITLEAKS_LICENSE is
+      # needed for this public repo. Bump both `version` and `sha256` together
+      # (the sha256 is from the release's gitleaks_<ver>_checksums.txt).
+      - name: Install gitleaks (pinned + checksum-verified)
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="8.30.1"
+          sha256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz"
+          curl --fail --show-error --location --retry 3 --output gitleaks.tar.gz "$url"
+          echo "${sha256}  gitleaks.tar.gz" | sha256sum --check
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          rm -f gitleaks.tar.gz gitleaks
+          gitleaks version
+      - name: gitleaks (commit history)
+        run: gitleaks git --redact --no-banner .
+      - name: gitleaks (working tree)
+        run: gitleaks dir --redact --no-banner .

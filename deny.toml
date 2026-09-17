@@ -1,0 +1,58 @@
+# cargo-deny configuration for reqsmith.
+# See https://embarkstudios.github.io/cargo-deny/ for the full schema.
+
+[graph]
+targets = []
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Each ignored advisory below has NO fix reachable from our current dependency
+# graph. Revisit on every dependency bump and remove entries that become
+# fixable. They are confined to the OPTIONAL `plugins` feature
+# (extism -> wasmtime tree) and never affect the default build.
+ignore = [
+  # wasmtime "stores can mix up type indices between engines" (LOW, 3.8).
+  # Only reachable with `--features plugins`. Patched in wasmtime >=46, but
+  # extism 1.30 pins wasmtime 43; no compatible upgrade exists yet.
+  "RUSTSEC-2026-0222",
+  # wasmtime filesystem sandbox escape via trailing slashes (HIGH, 8.8).
+  # Only reachable with `--features plugins`. Patched in wasmtime >=46.0.3, but
+  # extism 1.30 pins wasmtime 43; no compatible upgrade exists yet.
+  "RUSTSEC-2026-0269",
+  # Unmaintained crates pulled in transitively ONLY by the wasmtime/extism
+  # tree (plugins feature). No maintained replacement is selectable here.
+  "RUSTSEC-2026-0247", # bitmaps unmaintained
+  "RUSTSEC-2026-0250", # im-rc unmaintained
+  "RUSTSEC-2026-0251", # sized-chunks unmaintained
+]
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "MPL-2.0",
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

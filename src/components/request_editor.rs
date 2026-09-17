@@ -228,7 +228,7 @@ impl RequestEditorPane {
         self.dirty = false;
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn has_document(&self) -> bool {
         self.document.is_some()
     }
@@ -371,44 +371,36 @@ impl RequestEditorPane {
                 text.insert(*cursor, c);
                 *cursor += c.len_utf8();
             }
-            KeyCode::Backspace => {
-                if *cursor > 0 {
-                    let prev = text[..*cursor]
-                        .char_indices()
-                        .next_back()
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    text.drain(prev..*cursor);
-                    *cursor = prev;
-                }
+            KeyCode::Backspace if *cursor > 0 => {
+                let prev = text[..*cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                text.drain(prev..*cursor);
+                *cursor = prev;
             }
-            KeyCode::Delete => {
-                if *cursor < text.len() {
-                    let next_char_len = text[*cursor..]
-                        .chars()
-                        .next()
-                        .map(|c| c.len_utf8())
-                        .unwrap_or(0);
-                    text.drain(*cursor..*cursor + next_char_len);
-                }
+            KeyCode::Delete if *cursor < text.len() => {
+                let next_char_len = text[*cursor..]
+                    .chars()
+                    .next()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(0);
+                text.drain(*cursor..*cursor + next_char_len);
             }
-            KeyCode::Left => {
-                if *cursor > 0 {
-                    *cursor = text[..*cursor]
-                        .char_indices()
-                        .next_back()
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                }
+            KeyCode::Left if *cursor > 0 => {
+                *cursor = text[..*cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
             }
-            KeyCode::Right => {
-                if *cursor < text.len() {
-                    *cursor += text[*cursor..]
-                        .chars()
-                        .next()
-                        .map(|c| c.len_utf8())
-                        .unwrap_or(0);
-                }
+            KeyCode::Right if *cursor < text.len() => {
+                *cursor += text[*cursor..]
+                    .chars()
+                    .next()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(0);
             }
             KeyCode::Home => *cursor = 0,
             KeyCode::End => *cursor = text.len(),
@@ -455,32 +447,26 @@ impl RequestEditorPane {
                     }
                 }
             }
-            KeyCode::Up => {
-                if self.body_cursor_line > 0 {
-                    self.body_cursor_line -= 1;
-                    let new_lines: Vec<&str> = self.body_text.lines().collect();
-                    let line_len = new_lines
-                        .get(self.body_cursor_line)
-                        .map(|l| l.len())
-                        .unwrap_or(0);
-                    self.body_cursor_col = self.body_cursor_col.min(line_len);
-                }
+            KeyCode::Up if self.body_cursor_line > 0 => {
+                self.body_cursor_line -= 1;
+                let new_lines: Vec<&str> = self.body_text.lines().collect();
+                let line_len = new_lines
+                    .get(self.body_cursor_line)
+                    .map(|l| l.len())
+                    .unwrap_or(0);
+                self.body_cursor_col = self.body_cursor_col.min(line_len);
             }
-            KeyCode::Down => {
-                if self.body_cursor_line < line_count - 1 {
-                    self.body_cursor_line += 1;
-                    let new_lines: Vec<&str> = self.body_text.lines().collect();
-                    let line_len = new_lines
-                        .get(self.body_cursor_line)
-                        .map(|l| l.len())
-                        .unwrap_or(0);
-                    self.body_cursor_col = self.body_cursor_col.min(line_len);
-                }
+            KeyCode::Down if self.body_cursor_line < line_count - 1 => {
+                self.body_cursor_line += 1;
+                let new_lines: Vec<&str> = self.body_text.lines().collect();
+                let line_len = new_lines
+                    .get(self.body_cursor_line)
+                    .map(|l| l.len())
+                    .unwrap_or(0);
+                self.body_cursor_col = self.body_cursor_col.min(line_len);
             }
-            KeyCode::Left => {
-                if self.body_cursor_col > 0 {
-                    self.body_cursor_col -= 1;
-                }
+            KeyCode::Left if self.body_cursor_col > 0 => {
+                self.body_cursor_col -= 1;
             }
             KeyCode::Right => {
                 let current_line_len = lines
@@ -945,7 +931,7 @@ mod tests {
             body: Some("{\"name\": \"test\"}".into()),
             auth_plugin: None,
             assertions: vec![],
-            file_path: Some("/tmp/test.hurl.yml".into()),
+            file_path: Some("/tmp/test.req.yml".into()),
         }
     }
 

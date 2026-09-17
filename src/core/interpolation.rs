@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use super::models::RequestDocument;
 
-#[allow(dead_code)] // Used in Step 4.
 /// Interpolate `{{variable}}` placeholders in a template string.
 ///
 /// Returns the interpolated string on success, or a list of unresolved
@@ -42,7 +41,6 @@ pub fn interpolate(template: &str, vars: &HashMap<String, String>) -> Result<Str
     }
 }
 
-#[allow(dead_code)] // Used in Step 4.
 /// Interpolate all template fields in a `RequestDocument`, returning a new
 /// document with resolved values. The original document is not modified.
 pub fn interpolate_document(
@@ -126,7 +124,6 @@ pub fn interpolate_document(
 }
 
 /// Extract all `{{variable}}` names from a template string.
-#[allow(dead_code)] // Used by runner and validation modules.
 pub fn extract_variable_names(template: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut rest = template;

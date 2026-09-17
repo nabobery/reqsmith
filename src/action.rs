@@ -4,7 +4,6 @@ use crate::core::models::{AssertionReport, CollectionNode, RequestDocument, Resp
 
 /// Shared action vocabulary for state transitions across the application.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 pub enum Action {
     Tick,
     Render,

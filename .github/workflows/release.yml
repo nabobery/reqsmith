@@ -1,0 +1,278 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  # Manual dispatch is accepted only from a tag ref; the `guard` job below
+  # rejects a run whose ref is not a tag, so workflow_dispatch cannot mint a
+  # release from an arbitrary branch.
+  workflow_dispatch:
+
+# Serialize releases per ref; never cancel in flight — a half-published
+# release is worse than a queued one.
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# Least privilege by default: build and SBOM jobs only read the repo. Only the
+# final `release` job is granted write (and the id-token/attestations needed to
+# publish build provenance).
+permissions:
+  contents: read
+
+# Third-party actions are pinned to a full commit SHA (supply-chain hardening);
+# the trailing comment records the human-readable version. See the note in
+# checks.yml about dtolnay/rust-toolchain and taiki-e/install-action pinning.
+jobs:
+  # Gate the entire release on (a) being triggered by a tag and (b) the tag
+  # matching the version in Cargo.toml, before any build runs.
+  guard:
+    name: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - name: Verify release trigger and tag/version match
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            echo "::error::Release must be triggered by a tag push; got ref_type=${{ github.ref_type }}."
+            exit 1
+          fi
+          cargo_ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          tag_ver="${GITHUB_REF_NAME#v}"
+          echo "Cargo.toml version: ${cargo_ver}"
+          echo "Tag:                ${GITHUB_REF_NAME}"
+          if [ "${cargo_ver}" != "${tag_ver}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_ver}."
+            exit 1
+          fi
+
+  # Run the full quality/security gate (fmt, clippy, tests, MSRV, audit, deny,
+  # secret scan) on the tagged commit — the SAME reusable workflow CI uses.
+  # CI only runs on push/PR, so without this a tag on an unverified commit could
+  # publish binaries that never passed the gates. build/sbom depend on it below.
+  verify:
+    name: checks
+    permissions:
+      contents: read
+    uses: ./.github/workflows/checks.yml
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: [guard, verify]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            smoke: true
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            smoke: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            smoke: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            # macos-latest runners are arm64; an x86_64 binary is not
+            # guaranteed to run (Rosetta may be absent), so skip its smoke test.
+            smoke: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            smoke: true
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        with:
+          key: ${{ matrix.target }}
+
+      # cargo-auditable embeds the exact dependency list into the binary so the
+      # shipped artifact can later be scanned (`cargo audit bin`) for advisories.
+      - uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2.86.1
+        with:
+          tool: cargo-auditable
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo auditable build --release --locked --target ${{ matrix.target }}
+
+      - name: Smoke test (Unix)
+        if: matrix.smoke && runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "target/${{ matrix.target }}/release/reqsmith" --version
+          "target/${{ matrix.target }}/release/reqsmith" --help >/dev/null
+
+      - name: Smoke test (Windows)
+        if: matrix.smoke && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "target/${{ matrix.target }}/release/reqsmith.exe" --version
+          & "target/${{ matrix.target }}/release/reqsmith.exe" --help | Out-Null
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME:-dev}"
+          mkdir -p dist
+          archive="reqsmith-${version}-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/${archive}" reqsmith
+          (cd dist && shasum -a 256 "${archive}" > "${archive}.sha256")
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "dev" }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $archive = "reqsmith-$version-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/reqsmith.exe" -DestinationPath "dist/$archive"
+          $hash = Get-FileHash -Algorithm SHA256 "dist/$archive"
+          # Explicit LF: Out-File would emit CRLF and -NoNewline would fuse this
+          # line with the next one when the release job concatenates SHA256SUMS.
+          $sumPath = Join-Path (Get-Location).Path "dist/$archive.sha256"
+          [IO.File]::WriteAllText($sumPath, "$($hash.Hash.ToLower())  $archive`n")
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  sbom:
+    name: sbom
+    needs: [guard, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2.86.1
+        with:
+          tool: cargo-cyclonedx
+      - name: Generate CycloneDX SBOM
+        run: cargo cyclonedx --format json
+      - name: Collect SBOM
+        shell: bash
+        run: |
+          mkdir -p dist
+          find . -maxdepth 2 -name '*.cdx.json' -exec cp {} dist/ \;
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist-sbom
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: [guard, verify, build, sbom]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Only this job gets write. id-token + attestations are required to publish
+    # build provenance for the release artifacts.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    # A GitHub "release" environment can add required reviewers / protection
+    # rules before artifacts are published; configure it in repo settings (see
+    # docs/publishing.md). Harmless if the environment is left unprotected.
+    environment: release
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Build combined SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          cat ./*.sha256 > SHA256SUMS
+          # Fails the release if any per-archive line is malformed or truncated.
+          sha256sum -c SHA256SUMS
+          ls -la
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/SHA256SUMS
+            artifacts/*.cdx.json
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@62c96d0c4e8a889135c1f3a25910db8dbe0e85f7 # v2.3.4
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/*.sha256
+            artifacts/SHA256SUMS
+            artifacts/*.cdx.json
+          generate_release_notes: true
+          # Tags containing a prerelease identifier (for example, v0.1.0-rc.1)
+          # must not be published as the repository's latest stable release.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+
+  # Publish the crate to crates.io via Trusted Publishing (OIDC — no long-lived
+  # token stored anywhere). DORMANT BY DEFAULT: it only runs once the repository
+  # variable PUBLISH_TO_CRATES_IO is set to "true" (Settings → Secrets and
+  # variables → Actions → Variables). Until then it is skipped (skipped != red),
+  # so tagging never accidentally auto-publishes.
+  #
+  # Enable it ONLY after (1) the manual first `cargo publish` has created the
+  # crate and (2) Trusted Publishing is configured for it on crates.io (owner
+  # nabobery, repo reqsmith, workflow release.yml, environment release). See
+  # docs/crates-io-release.md. Depends on `release` (which itself needs
+  # guard+verify+build+sbom): a crates.io version is irreversible, so it must not
+  # be published unless every target binary built and the GitHub Release landed.
+  publish-crate:
+    name: publish-crate
+    if: vars.PUBLISH_TO_CRATES_IO == 'true'
+    needs: [release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # REQUIRED: lets the job request the OIDC token
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          toolchain: stable
+      # Exchanges this workflow's OIDC identity for a short-lived crates.io token.
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+      - name: cargo publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

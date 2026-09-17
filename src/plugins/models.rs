@@ -73,10 +73,10 @@ impl HookResult {
     /// Apply mutations from the hook result onto a cloned `RequestDocument`.
     pub fn apply_to_document(&self, doc: &RequestDocument) -> RequestDocument {
         let mut out = doc.clone();
-        if let Some(ref method) = self.method {
-            if let Some(m) = parse_method(method) {
-                out.method = m;
-            }
+        if let Some(ref method) = self.method
+            && let Some(m) = parse_method(method)
+        {
+            out.method = m;
         }
         if let Some(ref url) = self.url {
             out.url = url.clone();
@@ -315,6 +315,7 @@ mod tests {
             body_text: Some(r#"{"ok":true}"#.into()),
             body_bytes: None,
             is_binary: false,
+            truncated: false,
         };
 
         let ctx = ResponseContext::from_artifact(&artifact);
@@ -428,9 +429,10 @@ mod tests {
             content_type: Some("application/octet-stream".into()),
             content_length: Some(4),
             duration_ms: 50,
-            body_text: Some("[Binary response: 4 bytes. Press 'w' to save to disk.]".into()),
+            body_text: None,
             body_bytes: Some(vec![0, 1, 2, 3]),
             is_binary: true,
+            truncated: false,
         };
 
         let mutated = ResponseContext {

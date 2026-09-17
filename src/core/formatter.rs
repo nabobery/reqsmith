@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use super::atomic_write;
 use super::models::{KeyValueField, RequestDocument};
 use super::repository;
 
@@ -59,7 +60,6 @@ pub fn format_document(doc: &RequestDocument) -> String {
     if !doc.assertions.is_empty() {
         let yaml =
             serde_yaml::to_string(&doc.assertions).expect("assertions should serialize to YAML");
-        // Prefix with the key and indent the serialized block under it.
         lines.push("assertions:".into());
         for line in yaml.lines() {
             if line == "---" {
@@ -75,7 +75,6 @@ pub fn format_document(doc: &RequestDocument) -> String {
 }
 
 /// Check if a file is already formatted canonically.
-#[allow(dead_code)] // Used in Step 8.
 pub fn is_formatted(path: &Path) -> Result<bool, FormatterError> {
     let doc = repository::load_request(path).map_err(|e| FormatterError::Load(e.to_string()))?;
     let formatted = format_document(&doc);
@@ -84,7 +83,6 @@ pub fn is_formatted(path: &Path) -> Result<bool, FormatterError> {
 }
 
 /// Format a file in-place. Returns `true` if the file was changed.
-#[allow(dead_code)] // Used in Step 8.
 pub fn format_file(path: &Path) -> Result<bool, FormatterError> {
     let doc = repository::load_request(path).map_err(|e| FormatterError::Load(e.to_string()))?;
     let formatted = format_document(&doc);
@@ -92,12 +90,15 @@ pub fn format_file(path: &Path) -> Result<bool, FormatterError> {
     if formatted == current {
         return Ok(false);
     }
-    std::fs::write(path, &formatted).map_err(|e| FormatterError::Io(e.to_string()))?;
+    // Atomic, symlink-refusing overwrite via the shared writer rather than a
+    // bare `std::fs::write` (which would follow a symlinked request file and
+    // could leave a half-written file on interruption).
+    atomic_write::write_replace(path, formatted.as_bytes())
+        .map_err(|e| FormatterError::Io(e.to_string()))?;
     Ok(true)
 }
 
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)]
 pub enum FormatterError {
     #[error("Failed to load request: {0}")]
     Load(String),
@@ -250,7 +251,7 @@ mod tests {
     #[test]
     fn format_file_writes_and_reports_change() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("test.hurl.yml");
+        let path = tmp.path().join("test.req.yml");
 
         // Write unformatted YAML (different key order than canonical)
         std::fs::write(&path, "url: https://example.com\nname: Test\nmethod: GET\n").unwrap();
@@ -263,10 +264,26 @@ mod tests {
         assert!(!changed_again, "Already formatted file should not change");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn format_file_refuses_a_symlinked_request_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("real.req.yml");
+        let original = "url: https://example.com\nname: Test\nmethod: GET\n";
+        std::fs::write(&target, original).unwrap();
+        let link = tmp.path().join("link.req.yml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = format_file(&link).unwrap_err().to_string();
+        assert!(err.contains("is a symlink"), "{err}");
+        // The file behind the link must be byte-for-byte untouched.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+    }
+
     #[test]
     fn is_formatted_detects_unformatted() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("test.hurl.yml");
+        let path = tmp.path().join("test.req.yml");
         std::fs::write(&path, "url: https://example.com\nname: Test\nmethod: GET\n").unwrap();
 
         assert!(!is_formatted(&path).unwrap());

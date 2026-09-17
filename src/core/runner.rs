@@ -4,18 +4,20 @@ use tokio_util::sync::CancellationToken;
 
 use super::assertions;
 use super::environment::{apply_os_env_fallback, resolve_environment};
-use super::execution::{self, ExecutionError};
+use super::execution::{self, ExecutionError, ExecutionOptions};
 use super::interpolation::{extract_variable_names, interpolate_document};
 use super::models::{AssertionReport, ExitCode, RequestDocument, RunResult};
 use super::validation::validate_document;
 
 /// Options controlling how a request is run.
-#[allow(dead_code)] // Used in Step 8.
 pub struct RunOptions {
     pub env_name: Option<String>,
     pub cli_vars: Vec<(String, String)>,
     pub validate_before_run: bool,
     pub cwd: PathBuf,
+    /// Opt-in SSRF guard: reject requests to private/loopback hosts. Off by
+    /// default so `localhost` (the primary local-API use case) keeps working.
+    pub deny_private_networks: bool,
     #[cfg(feature = "plugins")]
     pub plugin_registry: Option<std::sync::Arc<crate::plugins::registry::PluginRegistry>>,
 }
@@ -23,7 +25,12 @@ pub struct RunOptions {
 /// Run a request through the shared execution pipeline.
 ///
 /// Used by both TUI and CLI to ensure identical behavior.
-#[allow(dead_code)] // Used in Step 8 + Step 10.
+///
+/// `client` must be built with
+/// `infra::http_client::build_client(options.deny_private_networks)`: the
+/// redirect-hop half of the private-network guard lives in the client's
+/// redirect policy, not in this function, so a mismatched client silently
+/// loses that half of the guard.
 pub async fn run_request(
     client: &reqwest::Client,
     doc: &RequestDocument,
@@ -227,10 +234,20 @@ pub async fn run_request(
         };
     }
 
-    // 4. Execute.
-    match execution::execute_request(client, &prepared_doc, &env.values, cancel).await {
+    let exec_options = ExecutionOptions {
+        deny_private_networks: options.deny_private_networks,
+    };
+    match execution::execute_request_with_options(
+        client,
+        &prepared_doc,
+        &env.values,
+        cancel,
+        exec_options,
+    )
+    .await
+    {
         Ok(artifact) => {
-            // 4.5. Post-response inspection hook.
+            // Post-response inspection hook.
             #[cfg(feature = "plugins")]
             let artifact = if let Some(registry) = &options.plugin_registry {
                 let resp_ctx = crate::plugins::models::ResponseContext::from_artifact(&artifact);
@@ -288,12 +305,15 @@ pub async fn run_request(
             cancelled: false,
             assertions: AssertionReport::default(),
         },
-        Err(e) => RunResult {
+        // A request rejected before connecting (bad scheme, blocked by the
+        // private-network policy, malformed after interpolation) is a
+        // validation-class failure, not an internal error.
+        Err(ExecutionError::InvalidRequest(msg)) => RunResult {
             request_name,
             request_file,
             response: None,
-            error: Some(e.to_string()),
-            exit_code: ExitCode::InternalError,
+            error: Some(msg),
+            exit_code: ExitCode::ValidationFailure,
             cancelled: false,
             assertions: AssertionReport::default(),
         },
@@ -344,7 +364,7 @@ mod tests {
             body: None,
             auth_plugin: None,
             assertions: vec![],
-            file_path: Some(PathBuf::from("test.hurl.yml")),
+            file_path: Some(PathBuf::from("test.req.yml")),
         }
     }
 
@@ -354,6 +374,7 @@ mod tests {
             cli_vars: vec![],
             validate_before_run: false,
             cwd: cwd.to_path_buf(),
+            deny_private_networks: false,
             #[cfg(feature = "plugins")]
             plugin_registry: None,
         }
@@ -389,9 +410,9 @@ mod tests {
     #[tokio::test]
     async fn run_request_env_resolution_failure() {
         let tmp = tempfile::tempdir().unwrap();
-        // Create hurl_envs.yml without the named env to trigger error
+        // Create reqsmith_envs.yml without the named env to trigger error
         std::fs::write(
-            tmp.path().join("hurl_envs.yml"),
+            tmp.path().join("reqsmith_envs.yml"),
             "environments:\n  prod:\n    X: y\n",
         )
         .unwrap();
@@ -402,6 +423,7 @@ mod tests {
             cli_vars: vec![],
             validate_before_run: false,
             cwd: tmp.path().to_path_buf(),
+            deny_private_networks: false,
             #[cfg(feature = "plugins")]
             plugin_registry: None,
         };
@@ -446,6 +468,7 @@ mod tests {
             cli_vars: vec![("base_url".into(), "http://127.0.0.1:9".into())],
             validate_before_run: false,
             cwd: tmp.path().to_path_buf(),
+            deny_private_networks: false,
             #[cfg(feature = "plugins")]
             plugin_registry: None,
         };
@@ -472,7 +495,7 @@ mod tests {
             body: None,
             auth_plugin: None,
             assertions: vec![],
-            file_path: Some(nested.join("test.hurl.yml")),
+            file_path: Some(nested.join("test.req.yml")),
         };
 
         let options = RunOptions {
@@ -480,6 +503,7 @@ mod tests {
             cli_vars: vec![],
             validate_before_run: true,
             cwd: std::env::temp_dir(),
+            deny_private_networks: false,
             #[cfg(feature = "plugins")]
             plugin_registry: None,
         };
@@ -487,6 +511,40 @@ mod tests {
         let client = reqwest::Client::new();
         let result = run_request(&client, &doc, &options, CancellationToken::new()).await;
         assert_eq!(result.exit_code, ExitCode::NetworkFailure);
+    }
+
+    #[tokio::test]
+    async fn run_request_blocks_loopback_when_deny_private_networks_is_set() {
+        // Proves the RunOptions flag is actually wired through to the
+        // execution policy (not dead code): with it on, a loopback URL is
+        // rejected as an invalid/blocked request before any connection.
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = simple_doc("http://127.0.0.1:9");
+        let options = RunOptions {
+            env_name: None,
+            cli_vars: vec![],
+            validate_before_run: false,
+            cwd: tmp.path().to_path_buf(),
+            deny_private_networks: true,
+            #[cfg(feature = "plugins")]
+            plugin_registry: None,
+        };
+
+        // Per the contract documented on `run_request`: the client must be
+        // built with the same `deny_private_networks` flag.
+        let client = crate::infra::http_client::build_client(true).unwrap();
+        let result = run_request(&client, &doc, &options, CancellationToken::new()).await;
+        // Blocked by policy before connecting -> validation-class failure, not
+        // a network error (which is what the same URL yields without the flag).
+        assert_eq!(result.exit_code, ExitCode::ValidationFailure);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|m| m.contains("network policy")),
+            "expected a policy-block error, got: {:?}",
+            result.error
+        );
     }
 
     #[tokio::test]

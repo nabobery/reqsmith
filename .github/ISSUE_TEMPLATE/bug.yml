@@ -1,0 +1,72 @@
+name: Bug report
+description: Report a problem with reqsmith
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report! Please fill out the
+        sections below as completely as you can.
+
+  - type: input
+    id: version
+    attributes:
+      label: reqsmith version
+      description: Output of `reqsmith --version`
+      placeholder: "e.g. reqsmith 0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: OS and version (e.g. macOS 15.1, Ubuntu 24.04, Windows 11)
+      placeholder: "e.g. macOS 15.1 (arm64)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps to reproduce the issue. Use a synthetic/fake request file if possible.
+      placeholder: |
+        1. Create a request file with '...'
+        2. Run `reqsmith ...`
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happened? Include error output/logs if relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that might help (config, plugin usage, screenshots, etc.)
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: secrets
+    attributes:
+      label: Secrets check
+      options:
+        - label: I have removed all real secrets/tokens from logs and examples
+          required: true

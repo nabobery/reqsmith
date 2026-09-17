@@ -4,6 +4,7 @@ use reqwest::Url;
 use reqwest::header::HeaderName;
 use serde_json_path::JsonPath;
 
+use super::execution::{ExecutionError, validate_scheme};
 use super::interpolation::{extract_variable_names, interpolate};
 use super::models::{
     Assertion, EnvironmentSet, HttpMethod, RequestDocument, ValidationDiagnostic, ValidationReport,
@@ -11,7 +12,6 @@ use super::models::{
 };
 
 /// Validate a request document for schema correctness and interpolation completeness.
-#[allow(dead_code)] // Used in Step 8.
 pub fn validate_document(doc: &RequestDocument, env: Option<&EnvironmentSet>) -> ValidationReport {
     let mut diagnostics = Vec::new();
 
@@ -32,14 +32,14 @@ pub fn validate_document(doc: &RequestDocument, env: Option<&EnvironmentSet>) ->
         });
     }
 
-    if let Some(auth_plugin) = &doc.auth_plugin {
-        if auth_plugin.trim().is_empty() {
-            diagnostics.push(ValidationDiagnostic {
-                severity: ValidationSeverity::Error,
-                message: "auth_plugin must not be empty when present".into(),
-                field: Some("auth_plugin".into()),
-            });
-        }
+    if let Some(auth_plugin) = &doc.auth_plugin
+        && auth_plugin.trim().is_empty()
+    {
+        diagnostics.push(ValidationDiagnostic {
+            severity: ValidationSeverity::Error,
+            message: "auth_plugin must not be empty when present".into(),
+            field: Some("auth_plugin".into()),
+        });
     }
 
     // Header key checks.
@@ -112,7 +112,17 @@ pub fn validate_document(doc: &RequestDocument, env: Option<&EnvironmentSet>) ->
 
     if let Some(url_for_validation) = interpolate_url_for_validation(&doc.url, env) {
         match Url::parse(&url_for_validation) {
-            Ok(_) => {}
+            // Keep `validate` in step with `run`, which rejects anything that
+            // is not http/https before it opens a connection.
+            Ok(url) => {
+                if let Err(ExecutionError::InvalidRequest(message)) = validate_scheme(&url) {
+                    diagnostics.push(ValidationDiagnostic {
+                        severity: ValidationSeverity::Error,
+                        message,
+                        field: Some("url".into()),
+                    });
+                }
+            }
             Err(error) => {
                 if error.to_string().contains("relative URL without a base") {
                     diagnostics.push(ValidationDiagnostic {
@@ -188,10 +198,10 @@ fn interpolate_url_for_validation(
     let env = env?;
     let mut vars = env.values.clone();
     for variable in extract_variable_names(url_template) {
-        if let Ok(value) = std::env::var(&variable) {
-            if let std::collections::hash_map::Entry::Vacant(entry) = vars.entry(variable) {
-                entry.insert(value);
-            }
+        if let Ok(value) = std::env::var(&variable)
+            && let std::collections::hash_map::Entry::Vacant(entry) = vars.entry(variable)
+        {
+            entry.insert(value);
         }
     }
 
@@ -365,6 +375,21 @@ mod tests {
                 .error_messages()
                 .iter()
                 .any(|message| message.to_ascii_lowercase().contains("header"))
+        );
+    }
+
+    #[test]
+    fn non_http_scheme_is_error() {
+        let mut doc = simple_doc();
+        doc.url = "file:///etc/passwd".into();
+
+        let report = validate_document(&doc, None);
+        assert!(report.has_errors());
+        assert!(
+            report
+                .error_messages()
+                .iter()
+                .any(|message| message.contains("Unsupported URL scheme"))
         );
     }
 

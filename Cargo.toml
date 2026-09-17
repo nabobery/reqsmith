@@ -1,10 +1,16 @@
 [package]
-name = "hurl"
+name = "reqsmith"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
-description = "Terminal-native API client"
+rust-version = "1.88"
+description = "Terminal-native API client — a keyboard-driven TUI + CLI for crafting HTTP requests as diffable YAML files"
 license = "MIT"
+repository = "https://github.com/nabobery/reqsmith"
+readme = "README.md"
+keywords = ["http", "api-client", "tui", "cli", "rest"]
+categories = ["command-line-utilities", "development-tools", "web-programming"]
+# Allowlist: only what a consumer of the published crate needs.
+include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE*", "/CHANGELOG.md"]
 
 [features]
 default = []
@@ -31,7 +37,11 @@ dotenvy = "0.15.7"
 tokio-util = { version = "0.7.18", features = ["rt"] }
 serde_json_path = "0.7"
 similar = "2"
-extism = { version = "1.7", optional = true }
+sha2 = "0.10"
+# NOTE: The `plugins` feature pulls in extism/wasmtime, which requires a newer
+# Rust than the crate's own MSRV (1.88). Building with `--features plugins`
+# needs Rust >= 1.91. The default (plugin-free) build keeps MSRV 1.88.
+extism = { version = "1.30", optional = true }
 toml = { version = "0.8", optional = true }
 
 [profile.release]
@@ -42,3 +52,6 @@ strip = true
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Builds the tiny WASM modules the `plugins` registry tests instantiate.
+# Pinned to the locked minor: an unpinned `1` could later require a newer MSRV than 1.88.
+wat = "1.245"

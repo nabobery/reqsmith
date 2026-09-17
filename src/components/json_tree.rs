@@ -57,45 +57,47 @@ impl JsonTreeState {
 
     /// Toggle expand/collapse on the selected node.
     pub fn toggle_selected(&mut self) {
-        if let Some(node) = self.nodes.get(self.selected) {
-            if node.is_expandable {
-                let path = node.path.clone();
-                if self.collapsed.contains(&path) {
-                    self.collapsed.remove(&path);
-                } else {
-                    self.collapsed.insert(path);
-                }
-                self.rebuild_visible();
-                // Clamp selection after rebuild.
-                if self.selected >= self.nodes.len() && !self.nodes.is_empty() {
-                    self.selected = self.nodes.len() - 1;
-                }
+        if let Some(node) = self.nodes.get(self.selected)
+            && node.is_expandable
+        {
+            let path = node.path.clone();
+            if self.collapsed.contains(&path) {
+                self.collapsed.remove(&path);
+            } else {
+                self.collapsed.insert(path);
+            }
+            self.rebuild_visible();
+            // Clamp selection after rebuild.
+            if self.selected >= self.nodes.len() && !self.nodes.is_empty() {
+                self.selected = self.nodes.len() - 1;
             }
         }
     }
 
     /// Collapse the selected node if it is expandable and currently expanded.
     pub fn collapse_selected(&mut self) {
-        if let Some(node) = self.nodes.get(self.selected) {
-            if node.is_expandable && node.is_expanded {
-                let path = node.path.clone();
-                self.collapsed.insert(path);
-                self.rebuild_visible();
-                if self.selected >= self.nodes.len() && !self.nodes.is_empty() {
-                    self.selected = self.nodes.len() - 1;
-                }
+        if let Some(node) = self.nodes.get(self.selected)
+            && node.is_expandable
+            && node.is_expanded
+        {
+            let path = node.path.clone();
+            self.collapsed.insert(path);
+            self.rebuild_visible();
+            if self.selected >= self.nodes.len() && !self.nodes.is_empty() {
+                self.selected = self.nodes.len() - 1;
             }
         }
     }
 
     /// Expand the selected node if it is expandable and currently collapsed.
     pub fn expand_selected(&mut self) {
-        if let Some(node) = self.nodes.get(self.selected) {
-            if node.is_expandable && !node.is_expanded {
-                let path = node.path.clone();
-                self.collapsed.remove(&path);
-                self.rebuild_visible();
-            }
+        if let Some(node) = self.nodes.get(self.selected)
+            && node.is_expandable
+            && !node.is_expanded
+        {
+            let path = node.path.clone();
+            self.collapsed.remove(&path);
+            self.rebuild_visible();
         }
     }
 
@@ -114,7 +116,7 @@ impl JsonTreeState {
     }
 
     /// Return the currently visible nodes.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn visible_nodes(&self) -> &[JsonTreeNode] {
         &self.nodes
     }
