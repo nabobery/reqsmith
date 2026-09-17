@@ -36,7 +36,7 @@ serde_json = "1.0.149"
 dotenvy = "0.15.7"
 tokio-util = { version = "0.7.18", features = ["rt"] }
 serde_json_path = "0.7"
-similar = "2"
+similar = "3"
 sha2 = "0.10"
 # NOTE: The `plugins` feature pulls in extism/wasmtime, which requires a newer
 # Rust than the crate's own MSRV (1.88). Building with `--features plugins`
