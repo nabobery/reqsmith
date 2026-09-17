@@ -12,9 +12,9 @@ once it reaches 1.0.
 
 - Nothing yet.
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-09-17
 
-Initial (pre-release) feature set:
+Initial feature set:
 
 ### Added
 

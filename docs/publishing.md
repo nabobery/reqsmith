@@ -118,11 +118,26 @@ policy has been confirmed.
 
 ## crates.io
 
-`reqsmith` is free on the crates.io index and its `Cargo.toml` metadata is
-publish-ready. The full step-by-step runbook — first manual publish, then
-Trusted Publishing (OIDC, no stored token) for subsequent releases — lives in
+The `Cargo.toml` metadata is publish-ready. The full step-by-step runbook —
+including the first manual publish and the later Trusted Publishing (OIDC,
+no stored token) flow — lives in
 [`crates-io-release.md`](crates-io-release.md).
 
-Until the crate is published, `cargo install --git
+The first release must be sequenced as follows:
+
+1. Keep the `PUBLISH_TO_CRATES_IO` repository variable unset or not equal to
+   `true`.
+2. Push the exact matching release tag, such as `v0.1.0`.
+3. Publish that tagged commit locally with a short-lived crates.io token.
+4. Configure crates.io Trusted Publishing for `nabobery/reqsmith`, workflow
+   `release.yml`, and the GitHub `release` environment.
+5. Create the GitHub `release` environment and set the repository variable
+   `PUBLISH_TO_CRATES_IO=true`.
+
+No `CARGO_REGISTRY_TOKEN` GitHub secret is required. The release workflow
+obtains a short-lived token through GitHub OIDC after Trusted Publishing is
+configured.
+
+Before the crate is published, `cargo install --git
 https://github.com/nabobery/reqsmith` and the GitHub Release binaries are the
 install paths.

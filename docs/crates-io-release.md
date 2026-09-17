@@ -13,16 +13,17 @@ top-to-bottom the first time; on later releases you'll mostly use
 
 ---
 
-## 0. Where things stand today
+## 0. Release status
 
-Verified at the time this doc was written:
+Before the first release, verify the following:
 
-- ✅ **`reqsmith` is available** on the crates.io index (not taken).
+- ☐ **The `reqsmith` crate name is still available** on the crates.io index
+  (not taken). Check it immediately before the first publish.
 - ✅ **Metadata is complete** in `Cargo.toml` (`description`, `license`,
   `repository`, `readme`, `keywords`, `categories`, `rust-version`).
-- ✅ **`cargo publish --dry-run --locked` passes** — packaged and
-  verify-compiled with no errors. Run the dry run and inspect its reported
-  file count and compressed size before publishing.
+- ☐ **`cargo publish --dry-run --locked` passes** — package and
+  verify-compile the crate with no errors. Inspect the reported file count and
+  compressed size before publishing.
 - ✅ **Publish automation is wired but dormant.** The `publish-crate` job in
   `release.yml` runs only when the repository variable
   `PUBLISH_TO_CRATES_IO=true`; see [§6](#6-automated-releases-trusted-publishing).
@@ -36,6 +37,13 @@ can only be configured for a crate that *already exists*. So the **first
 release must be a manual, token-based publish** ([§5](#5-first-release-manual-token-based));
 after that, switch to Trusted Publishing for every subsequent release
 ([§6](#6-automated-releases-trusted-publishing)).
+
+For the initial release, leave `PUBLISH_TO_CRATES_IO` unset (or set to a
+value other than `true`) while pushing the `v0.1.0` tag. Publish the exact
+tagged commit locally, configure Trusted Publishing and the `release`
+environment, and only then set `PUBLISH_TO_CRATES_IO=true`. Do not rerun the
+same tag after the manual publish; crates.io rejects an existing
+`reqsmith@0.1.0` version.
 
 ---
 
