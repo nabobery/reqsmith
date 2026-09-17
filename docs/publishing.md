@@ -110,11 +110,11 @@ git tag -a v0.1.0-rc.1 -m "Release v0.1.0-rc.1"
 git push origin v0.1.0-rc.1
 ```
 
-The workflow creates a normal GitHub Release by default. Mark it as a
-pre-release in the GitHub UI before announcing it, or update
-`.github/workflows/release.yml` to pass `prerelease: true` to
-`softprops/action-gh-release`. Do not publish a prerelease until the intended
-crates.io versioning and Trusted Publishing policy has been confirmed.
+The workflow automatically marks tags containing a prerelease identifier as
+GitHub prereleases, so `v0.1.0-rc.1` is not published as the latest stable
+release. Stable tags such as `v0.1.0` remain normal releases. Do not publish a
+prerelease until the intended crates.io versioning and Trusted Publishing
+policy has been confirmed.
 
 ## crates.io
 

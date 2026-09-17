@@ -237,6 +237,9 @@ jobs:
             artifacts/SHA256SUMS
             artifacts/*.cdx.json
           generate_release_notes: true
+          # Tags containing a prerelease identifier (for example, v0.1.0-rc.1)
+          # must not be published as the repository's latest stable release.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           fail_on_unmatched_files: true
 
   # Publish the crate to crates.io via Trusted Publishing (OIDC — no long-lived
