@@ -42,7 +42,7 @@ sha2 = "0.10"
 # Rust than the crate's own MSRV (1.88). Building with `--features plugins`
 # needs Rust >= 1.91. The default (plugin-free) build keeps MSRV 1.88.
 extism = { version = "1.30", optional = true }
-toml = { version = "0.8", optional = true }
+toml = { version = "0.9", optional = true }
 
 [profile.release]
 lto = true
